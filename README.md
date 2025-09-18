@@ -136,9 +136,9 @@ done
 
 ```bash
 # Download the script
-wget https://raw.githubusercontent.com/yourusername/dupefinder-pro/main/dupefinder.sh
+wget https://raw.githubusercontent.com/morroware/DupeFinder/main/dupefinder.sh
 # OR
-curl -O https://raw.githubusercontent.com/yourusername/dupefinder-pro/main/dupefinder.sh
+curl -O https://raw.githubusercontent.com/morroware/DupeFinder/main/dupefinder.sh
 
 # Make executable
 chmod +x dupefinder.sh
@@ -152,7 +152,7 @@ chmod +x dupefinder.sh
 ```bash
 # Download and install
 sudo wget -O /usr/local/bin/dupefinder \
-    https://raw.githubusercontent.com/yourusername/dupefinder-pro/main/dupefinder.sh
+    https://raw.githubusercontent.com/morroware/DupeFinder/main/upefinder.sh
 sudo chmod +x /usr/local/bin/dupefinder
 
 # Create configuration directory
@@ -167,7 +167,7 @@ dupefinder --version
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/dupefinder-pro.git
+git clone https://github.com/morroware/DupeFinder/main/DupeFinder.git
 cd dupefinder-pro
 
 # Install
@@ -1077,7 +1077,7 @@ find_and_report() {
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/dupefinder-pro.git
+git clone https://github.com/morroware/DupeFinder/main/DupeFinder.git
 cd dupefinder-pro
 
 # Run tests
@@ -1314,14 +1314,14 @@ A: Yes, use `--fuzzy` with `--similarity` to find files with similar sizes.
 
 ### Documentation
 
-- **GitHub Wiki**: https://github.com/yourusername/dupefinder-pro/wiki
+- **GitHub Wiki**: https://github.com/morroware/DupeFinder/main/DupeFinder/wiki
 - **Man Page**: `man dupefinder` (after installation)
 - **Examples**: `/usr/share/doc/dupefinder/examples/`
 
 ### Getting Help
 
-1. **Issue Tracker**: https://github.com/yourusername/dupefinder-pro/issues
-2. **Discussions**: https://github.com/yourusername/dupefinder-pro/discussions
+1. **Issue Tracker**: https://github.com/morroware/DupeFinder/main/DupeFinder/issues
+2. **Discussions**: https://github.com/morroware/DupeFinder/main/DupeFinder/discussions
 3. **Email**: support@dupefinderpro.example.com
 
 ### Community
