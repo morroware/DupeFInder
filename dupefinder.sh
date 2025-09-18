@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #############################################################################
 # DupeFinder Pro - Advanced Duplicate File Manager for Linux
-# Version: 0.0.1
+# Version: 0.0.3
 # Author: Seth Morrow
 # License: MIT
 #
@@ -9,7 +9,13 @@
 #   Professional duplicate file finder with advanced management, reporting,
 #   caching, smart deletion strategies, and critical system file protection.
 #   This version includes comprehensive safety features to prevent accidental
-#   deletion of system-critical files and libraries.
+#   deletion of system-critical files and libraries, enhanced verbose output,
+#   and significantly improved interactive mode.
+#
+# Fixes in this version:
+# - Corrected a critical bug in the 'show_duplicate_details' function
+#   where the pipeline for sorting files in 'keep-oldest' mode was
+#   incomplete, causing a syntax error.
 #
 #############################################################################
 
@@ -30,7 +36,7 @@ DIM='\033[2m'
 # ═══════════════════════════════════════════════════════════════════════════
 # DEFAULT CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
-VERSION="0.0.1"
+VERSION="0.0.3"
 AUTHOR="Seth Morrow"
 SEARCH_PATH="$(pwd)"
 EXCLUDE_PATHS=("/proc" "/sys" "/dev" "/run" "/tmp" "/var/run" "/var/lock" "/mnt" "/media")
@@ -58,84 +64,11 @@ PROGRESS_BAR=1
 TEMP_DIR=""
 BACKUP_DIR=""
 USE_TRASH=0
-HARDLINK_MODE=0#!/usr/bin/env bash
-#############################################################################
-# DupeFinder Pro - Advanced Duplicate File Manager for Linux
-# Version: 0.0.3
-# Author: Seth Morrow
-# License: MIT
-#
-# Description:
-#   Professional duplicate file finder with advanced management, reporting,
-#   caching, smart deletion strategies, and critical system file protection.
-#   This version includes comprehensive safety features to prevent accidental
-#   deletion of system-critical files and libraries, enhanced verbose output,
-#   and significantly improved interactive mode.
-#
-# Fixes in this version:
-# - Corrected a critical bug in the 'show_duplicate_details' function
-#   where the pipeline for sorting files in 'keep-oldest' mode was
-#   incomplete, causing a syntax error.
-# - Updated the interactive menu prompt 'Auto Rest' to the more intuitive
-#   'Apply to All' to improve user experience.
-#
-#############################################################################
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TERMINAL COLORS AND FORMATTING
-# Define a set of color codes to make the terminal output more readable and
-# visually distinct, improving the user experience and drawing attention to
-# important information like warnings and errors.
-# ═══════════════════════════════════════════════════════════════════════════
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-MAGENTA='\033[0;35m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-NC='\033[0m' # No Color - Resets formatting to default
-BOLD='\033[1m'
-DIM='\033[2m'
-
-# ═══════════════════════════════════════════════════════════════════════════
-# DEFAULT CONFIGURATION
-# These variables define the default behavior of the script. They can be
-# overridden by command-line arguments or a configuration file.
-# ═══════════════════════════════════════════════════════════════════════════
-VERSION="0.0.3"
-AUTHOR="Seth Morrow"
-SEARCH_PATH="$(pwd)"
-EXCLUDE_PATHS=("/proc" "/sys" "/dev" "/run" "/tmp" "/var/run" "/var/lock" "/mnt" "/media")
-MIN_SIZE=1 # Default minimum file size in bytes (1 byte)
-MAX_SIZE="" # No maximum size by default
-OUTPUT_DIR="$HOME/duplicate_reports"
-HTML_REPORT="duplicates_$(date +%Y%m%d_%H%M%S).html"
-CSV_REPORT=""
-JSON_REPORT=""
-DELETE_MODE=0
-DRY_RUN=0
-VERBOSE=0
-QUIET=0
-FOLLOW_SYMLINKS=0
-EMPTY_FILES=0
-HIDDEN_FILES=0
-MAX_DEPTH=""
-FILE_PATTERN=()
-HASH_ALGORITHM="md5sum" # Default hashing algorithm
-INTERACTIVE_DELETE=0
-KEEP_NEWEST=0
-KEEP_OLDEST=0
-KEEP_PATH_PRIORITY=""
-PROGRESS_BAR=1
-TEMP_DIR=""
-BACKUP_DIR=""
-USE_TRASH=0
 HARDLINK_MODE=0
 QUARANTINE_DIR=""
 DB_CACHE="$HOME/.dupefinder_cache.db"
 USE_CACHE=0
-THREADS=$(nproc) # Use all available CPU cores by default
+THREADS=$(nproc)
 EMAIL_REPORT=""
 CONFIG_FILE=""
 FUZZY_MATCH=0
@@ -153,9 +86,6 @@ RESUME_STATE=""
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CRITICAL SYSTEM PROTECTION CONFIGURATION
-# These arrays define files and paths that are critical for system operation.
-# They are automatically protected from deletion unless the user explicitly
-# provides the '--force-system' flag.
 # ═══════════════════════════════════════════════════════════════════════════
 CRITICAL_EXTENSIONS=(
   ".so"     # Shared libraries
@@ -219,13 +149,11 @@ NEVER_DELETE_PATTERNS=(
 )
 
 # Safety flags
-SKIP_SYSTEM_FOLDERS=0    # When enabled, excludes all system folders
-FORCE_SYSTEM_DELETE=0    # Dangerous flag, requires explicit confirmation
+SKIP_SYSTEM_FOLDERS=0
+FORCE_SYSTEM_DELETE=0
 
 # ═══════════════════════════════════════════════════════════════════════════
 # STATISTICS COUNTERS
-# Global variables to track statistics throughout the script's execution,
-# used for the final summary and reports.
 # ═══════════════════════════════════════════════════════════════════════════
 TOTAL_FILES=0
 TOTAL_DUPLICATES=0
@@ -239,33 +167,25 @@ DUPLICATE_GROUPS=""
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SMART LOCATION PRIORITIES
-# This associative array assigns a priority score to different directory
-# locations. A lower number indicates a higher priority for keeping files.
-# This is used by the '--smart-delete' feature.
 # ═══════════════════════════════════════════════════════════════════════════
 declare -A LOCATION_PRIORITY=(
-  ["/home"]=1         # User files - highest priority
-  ["/usr/local"]=2    # Local installations
-  ["/opt"]=3          # Optional software
-  ["/var"]=4          # Variable data
-  ["/tmp"]=99         # Temporary files - lowest priority
-  ["/downloads"]=90   # Downloads folder
-  ["/cache"]=95       # Cache directories
+  ["/home"]=1
+  ["/usr/local"]=2
+  ["/opt"]=3
+  ["/var"]=4
+  ["/tmp"]=99
+  ["/downloads"]=90
+  ["/cache"]=95
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CLEANUP AND SIGNAL HANDLING
-# Ensures proper cleanup of temporary files and state management in case
-# of successful completion or an unexpected interruption (e.g., Ctrl+C).
 # ═══════════════════════════════════════════════════════════════════════════
 cleanup() {
-  # Remove the temporary directory created for this session
   if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
     rm -rf "$TEMP_DIR"
   fi
-  # Log the session end time if logging is enabled
   [[ -n "$LOG_FILE" ]] && echo "$(date): Session ended" >> "$LOG_FILE"
-  # Remove the resume state file if the scan completed successfully
   if [[ -n "$SCAN_END_TIME" && "$SCAN_END_TIME" -gt 0 ]]; then
     rm -f "$HOME/.dupefinder_state"
   fi
@@ -283,22 +203,17 @@ handle_interrupt() {
     fi
   fi
   cleanup
-  # Exit with code 130 to indicate user interruption
   exit 130
 }
 
-# Set up signal handlers for graceful shutdown
 trap handle_interrupt INT TERM
 trap cleanup EXIT
 
-# Create a temporary directory for session files
 TEMP_DIR="/tmp/dupefinder_$$"
 mkdir -p "$TEMP_DIR"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # USER INTERFACE FUNCTIONS
-# Functions for displaying the script's header, help information, and other
-# user-facing messages.
 # ═══════════════════════════════════════════════════════════════════════════
 show_header() {
   clear
@@ -410,7 +325,6 @@ EOF
 
 # ═══════════════════════════════════════════════════════════════════════════
 # UTILITY FUNCTIONS
-# Helper functions for size parsing, SQL escaping, and data formatting.
 # ═══════════════════════════════════════════════════════════════════════════
 parse_size() {
   local s="$1"
@@ -456,28 +370,22 @@ sql_escape() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CRITICAL SAFETY VERIFICATION FUNCTIONS
-# Multiple layers of checks to prevent accidental deletion of important files,
-# including system files, actively used files, and files with specific patterns.
 # ═══════════════════════════════════════════════════════════════════════════
 is_critical_system_file() {
   local file="$1"
   local basename_file
   basename_file=$(basename "$file")
-  # Layer 1: Check against critical file extensions
   for ext in "${CRITICAL_EXTENSIONS[@]}"; do
     [[ "$file" == *"$ext" ]] && return 0
   done
-  # Layer 2: Check if file is in a critical system path
   for path in "${CRITICAL_PATHS[@]}"; do
     [[ "$file" == "$path"/* ]] && return 0
   done
-  # Layer 3: Check against never-delete filename patterns
   for pattern in "${NEVER_DELETE_PATTERNS[@]}"; do
     if [[ "$basename_file" == $pattern ]]; then
       return 0
     fi
   done
-  # Layer 4: Check if it's a system binary in a critical location
   if [[ -x "$file" ]]; then
     case "$(dirname "$file")" in
       /bin|/sbin|/usr/bin|/usr/sbin|/usr/local/bin|/usr/local/sbin)
@@ -490,7 +398,6 @@ is_critical_system_file() {
 
 verify_safe_to_delete() {
   local file="$1"
-  # First check: Is this a critical system file?
   if is_critical_system_file "$file"; then
     if [[ $FORCE_SYSTEM_DELETE -eq 1 ]]; then
       echo -e "${RED}⚠ WARNING: Critical system file detected: $file${NC}"
@@ -502,7 +409,6 @@ verify_safe_to_delete() {
       return 1
     fi
   fi
-  # Second check: Is the file currently in use?
   if command -v lsof &>/dev/null; then
     if lsof "$file" >/dev/null 2>&1; then
       echo -e "${YELLOW}  ⚠ File is currently in use: $file${NC}"
@@ -515,14 +421,12 @@ verify_safe_to_delete() {
       fi
     fi
   fi
-  # Third check: Is this a loaded shared library?
   if [[ "$file" == *.so* ]]; then
     if grep -q "$(basename "$file")" /proc/*/maps 2>/dev/null; then
       echo -e "${RED}  ✗ Shared library is currently loaded: $file${NC}"
       return 1
     fi
   fi
-  # Fourth check: Warn if file is owned by root
   local owner
   owner=$(stat -c '%U' "$file" 2>/dev/null)
   if [[ "$owner" == "root" && "$USER" != "root" ]]; then
@@ -573,8 +477,6 @@ show_safety_summary() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # STATE MANAGEMENT FUNCTIONS
-# Functions for saving and loading the scan state to allow for interrupted
-# scans to be resumed.
 # ═══════════════════════════════════════════════════════════════════════════
 save_state() {
   cat > "$HOME/.dupefinder_state" << EOF
@@ -607,8 +509,6 @@ load_state() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONFIGURATION MANAGEMENT
-# Handles the parsing of command-line arguments and loading of external
-# configuration files.
 # ═══════════════════════════════════════════════════════════════════════════
 load_config() {
   if [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]]; then
@@ -681,8 +581,6 @@ parse_arguments() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # INITIALIZATION AND VALIDATION
-# Checks for dependencies, validates input parameters, and sets up the
-# execution environment.
 # ═══════════════════════════════════════════════════════════════════════════
 init_logging() {
   if [[ -n "$LOG_FILE" ]]; then
@@ -693,7 +591,6 @@ init_logging() {
 }
 
 check_dependencies() {
-  # Check for SQLite3 if caching is requested
   if [[ $USE_CACHE -eq 1 || $SAVE_CHECKSUMS -eq 1 ]]; then
     if ! command -v sqlite3 &>/dev/null; then
       echo -e "${RED}Error: sqlite3 is not installed. Cache/checksum disabled.${NC}"
@@ -702,24 +599,20 @@ check_dependencies() {
       SAVE_CHECKSUMS=0
     fi
   fi
-  # Check for trash-cli if trash mode is requested
   if [[ $USE_TRASH -eq 1 ]] && ! command -v trash-put &>/dev/null; then
     echo -e "${YELLOW}Warning: trash-cli not installed. Falling back to rm.${NC}"
     echo -e "${YELLOW}Install with: sudo apt install trash-cli${NC}"
     USE_TRASH=0
   fi
-  # Check for GNU parallel if requested
   if [[ $USE_PARALLEL -eq 1 ]] && ! command -v parallel &>/dev/null; then
     echo -e "${YELLOW}Warning: GNU parallel not installed. Using xargs.${NC}"
     echo -e "${YELLOW}Install with: sudo apt install parallel${NC}"
     USE_PARALLEL=0
   fi
-  # Check for mail command if email reporting is requested
   if [[ -n "$EMAIL_REPORT" ]] && ! command -v mail &>/dev/null; then
     echo -e "${YELLOW}Warning: 'mail' command not found. Email disabled.${NC}"
     EMAIL_REPORT=""
   fi
-  # Check for jq if JSON reporting is requested
   if [[ -n "$JSON_REPORT" ]] && ! command -v jq &>/dev/null; then
     echo -e "${RED}Error: jq is not installed. JSON report disabled.${NC}"
     echo -e "${YELLOW}Install with: sudo apt install jq${NC}"
@@ -728,16 +621,13 @@ check_dependencies() {
 }
 
 validate_inputs() {
-  # Attempt to resume previous scan if requested
   if [[ $RESUME_STATE -eq 1 ]] && load_state; then
     echo -e "${GREEN}Resuming previous scan${NC}"
   fi
-  # Validate search path existence
   if [[ ! -d "$SEARCH_PATH" ]]; then
     echo -e "${RED}Error: Search path does not exist: $SEARCH_PATH${NC}"
     exit 1
   fi
-  # Create and validate output directory
   mkdir -p "$OUTPUT_DIR" || {
     echo -e "${RED}Cannot create output directory: $OUTPUT_DIR${NC}"
     exit 1
@@ -746,17 +636,14 @@ validate_inputs() {
     echo -e "${RED}Error: Cannot write to output directory: $OUTPUT_DIR${NC}"
     exit 1
   fi
-  # Validate thread count
   if ! [[ "$THREADS" =~ ^[0-9]+$ ]] || [[ "$THREADS" -lt 1 ]]; then
     THREADS=$(nproc)
     [[ $VERBOSE -eq 1 ]] && echo -e "${YELLOW}Invalid thread count, using $THREADS threads${NC}"
   fi
-  # Check for conflicting keep strategies
   if [[ $KEEP_NEWEST -eq 1 && $KEEP_OLDEST -eq 1 ]]; then
     echo -e "${RED}Error: Cannot use both --keep-newest and --keep-oldest${NC}"
     exit 1
   fi
-  # Validate and create quarantine directory if specified
   if [[ -n "$QUARANTINE_DIR" ]]; then
     mkdir -p "$QUARANTINE_DIR" || {
       echo -e "${RED}Cannot create quarantine directory${NC}"
@@ -767,7 +654,6 @@ validate_inputs() {
       exit 1
     }
   fi
-  # Validate and create backup directory if specified
   if [[ -n "$BACKUP_DIR" ]]; then
     mkdir -p "$BACKUP_DIR" || {
       echo -e "${RED}Cannot create backup directory${NC}"
@@ -778,13 +664,11 @@ validate_inputs() {
       exit 1
     }
   fi
-  # Process exclude list file if provided
   if [[ -n "$EXCLUDE_LIST_FILE" && -f "$EXCLUDE_LIST_FILE" ]]; then
     while IFS= read -r line; do
       [[ -n "$line" && ! "$line" =~ ^# ]] && EXCLUDE_PATHS+=("$line")
     done < "$EXCLUDE_LIST_FILE"
   fi
-  # Add system folders to exclude list if requested
   if [[ $SKIP_SYSTEM_FOLDERS -eq 1 ]]; then
     for sys_folder in "${SYSTEM_FOLDERS[@]}"; do
       if [[ -d "$sys_folder" ]]; then
@@ -797,7 +681,6 @@ validate_inputs() {
     done
     [[ $VERBOSE -eq 1 ]] && echo -e "${CYAN}Excluding system folders: ${SYSTEM_FOLDERS[*]}${NC}"
   fi
-  # Safety warning for root execution without system protection
   if [[ "$USER" == "root" && $SKIP_SYSTEM_FOLDERS -eq 0 ]]; then
     echo -e "${YELLOW}⚠ WARNING: Running as root without --skip-system${NC}"
     echo -e "${YELLOW}  System files could be affected. Consider using --skip-system${NC}"
@@ -807,7 +690,6 @@ validate_inputs() {
       [[ "$response" != "y" && "$response" != "Y" ]] && exit 1
     fi
   fi
-  # Display warning about excluded external media
   if printf '%s\n' "${EXCLUDE_PATHS[@]}" | grep -qE '^/mnt$|^/media$'; then
     echo -e "${YELLOW}Note:${NC} /mnt and /media are excluded by default."
     echo -e "${YELLOW}      Remove from --exclude to scan external drives.${NC}"
@@ -816,7 +698,6 @@ validate_inputs() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DATABASE CACHE MANAGEMENT
-# SQLite-based caching for improved performance on repeated scans.
 # ═══════════════════════════════════════════════════════════════════════════
 init_cache() {
   if [[ $USE_CACHE -eq 1 || $SAVE_CHECKSUMS -eq 1 ]]; then
@@ -832,10 +713,8 @@ CREATE TABLE IF NOT EXISTS file_hashes (
 CREATE INDEX IF NOT EXISTS idx_hash ON file_hashes(hash);
 CREATE INDEX IF NOT EXISTS idx_size ON file_hashes(size);
 EOF
-    # Clean old entries (older than 30 days) to prevent the database from growing indefinitely
     local cutoff=$(($(date +%s) - 2592000))
     sqlite3 "$DB_CACHE" "DELETE FROM file_hashes WHERE last_scan < $cutoff;" >/dev/null 2>&1
-    # Initialize SQL buffer for batch operations
     : > "$TEMP_DIR/sql_buffer.sql"
   fi
 }
@@ -844,12 +723,10 @@ flush_cache_batch() {
   if [[ $USE_CACHE -eq 1 || $SAVE_CHECKSUMS -eq 1 ]]; then
     if [[ -s "$TEMP_DIR/sql_buffer.sql" ]]; then
       [[ $VERBOSE -eq 1 ]] && echo -e "${CYAN}Flushing batched SQLite writes...${NC}"
-      # Wrap all operations in a single transaction for better performance
       printf 'BEGIN IMMEDIATE;\n' > "$TEMP_DIR/sql_txn.sql"
       cat "$TEMP_DIR/sql_buffer.sql" >> "$TEMP_DIR/sql_txn.sql"
       printf 'COMMIT;\n' >> "$TEMP_DIR/sql_txn.sql"
       sqlite3 "$DB_CACHE" < "$TEMP_DIR/sql_txn.sql" >/dev/null 2>&1
-      # Clear buffer for next batch
       : > "$TEMP_DIR/sql_buffer.sql"
     fi
   fi
@@ -857,15 +734,12 @@ flush_cache_batch() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FILE DISCOVERY
-# Finds all files matching the specified criteria using the 'find' command.
 # ═══════════════════════════════════════════════════════════════════════════
 find_files() {
   [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}🔍 Scanning filesystem...${NC}"
   local find_cmd="find"
   local args=("$SEARCH_PATH")
-  # Add max depth if specified
   [[ -n "$MAX_DEPTH" ]] && args+=(-maxdepth "$MAX_DEPTH")
-  # Add exclude paths with proper pruning
   if [[ ${#EXCLUDE_PATHS[@]} -gt 0 ]]; then
     args+=(\()
     local first=1
@@ -879,13 +753,11 @@ find_files() {
     done
     args+=(\) -o)
   fi
-  # Add file type and other filters
   args+=(-type f)
   [[ $HIDDEN_FILES -eq 0 ]] && args+=(-not -path '*/.*')
   [[ $FOLLOW_SYMLINKS -eq 0 ]] && args+=(-not -type l)
   [[ $MIN_SIZE -gt 0 ]] && args+=(-size "+${MIN_SIZE}c")
   [[ -n "$MAX_SIZE" ]] && args+=(-size "-${MAX_SIZE}c")
-  # Add file pattern filters if specified
   if [[ ${#FILE_PATTERN[@]} -gt 0 ]]; then
     args+=(\()
     local firstp=1
@@ -899,41 +771,32 @@ find_files() {
     done
     args+=(\))
   fi
-  # Output null-delimited for safety with file paths
   args+=(-print0)
   [[ $VERBOSE -eq 1 ]] && echo -e "${CYAN}Find command:${NC} $find_cmd ${args[*]}"
-  # Execute find and save results
   "$find_cmd" "${args[@]}" 2>/dev/null > "$TEMP_DIR/files.list"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
 # HASH CALCULATION
-# Calculates checksums for all discovered files, with parallelization and
-# caching for performance.
 # ═══════════════════════════════════════════════════════════════════════════
 hash_worker() {
   local file="$1"
   local algo="$2"
   local fast="$3"
   local worker_id="$4"
-  # Skip unreadable files silently
   [[ ! -r "$file" ]] && return 0
   local mtime size hash
   mtime=$(stat -c%Y "$file" 2>/dev/null) || mtime=0
   size=$(stat -c%s "$file" 2>/dev/null) || size=0
   if [[ "$fast" == "1" ]]; then
-    # Fast mode: use size and partial name hash
     local name_hash
     name_hash=$(basename "$file" | md5sum | cut -d' ' -f1)
     hash="${size}_${name_hash:0:16}"
   else
-    # Full file hash
     hash=$($algo "$file" 2>/dev/null | cut -d' ' -f1)
   fi
   [[ -z "$hash" ]] && return 0
-  # Output result to worker-specific file
   printf '%s|%s|%s\n' "$hash" "$size" "$file"
-  # Also prepare SQL for caching if enabled
   if [[ "$USE_CACHE" == "1" || "$SAVE_CHECKSUMS" == "1" ]]; then
     local esc
     esc=$(sql_escape "$file")
@@ -941,10 +804,10 @@ hash_worker() {
       "$esc" "$hash" "$size" "$mtime" "$(date +%s)" >> "$TEMP_DIR/sql_${worker_id}.sql"
   fi
 }
-# Export function and variables for parallel execution
+
 export -f hash_worker sql_escape
 export HASH_ALGORITHM FAST_MODE USE_CACHE DB_CACHE SAVE_CHECKSUMS TEMP_DIR
-# Show progress during hash calculation
+
 show_progress() {
   local current=$1
   local total=$2
@@ -973,11 +836,9 @@ calculate_hashes() {
   fi
   mkdir -p "$TEMP_DIR/workers"
   if [[ $USE_PARALLEL -eq 1 ]]; then
-    # Use GNU parallel for high-efficiency parallelization
     < "$TEMP_DIR/files.list" parallel -0 -j "$THREADS" --no-notice --results "$TEMP_DIR/workers" \
       "worker_id=\$PARALLEL_SEQ; hash_worker {} '$HASH_ALGORITHM' '$FAST_MODE' \$worker_id; echo 1 >> '$TEMP_DIR/prog.count'" &
   else
-    # Use xargs as a fallback for parallelization
     local job_num=0
     while IFS= read -r -d '' filepath; do
       ((job_num++))
@@ -1026,7 +887,6 @@ calculate_hashes() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DUPLICATE DETECTION
-# Analyzes the calculated hashes to find and group duplicate files.
 # ═══════════════════════════════════════════════════════════════════════════
 find_duplicates() {
   [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}🔎 Analyzing duplicates...${NC}"
@@ -1086,12 +946,10 @@ find_similar_files() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SMART DELETION STRATEGIES
-# Functions to intelligently select which file in a duplicate group to keep,
-# based on user-defined or default heuristics.
 # ═══════════════════════════════════════════════════════════════════════════
 get_location_priority() {
   local path="$1"
-  local priority=50 # Default priority
+  local priority=50
   for loc in "${!LOCATION_PRIORITY[@]}"; do
     if [[ "$path" == *"$loc"* ]]; then
       priority=${LOCATION_PRIORITY[$loc]}
@@ -1119,7 +977,6 @@ select_file_to_keep() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ENHANCED VERBOSE OUTPUT
-# Displays detailed information about each group of duplicates found.
 # ═══════════════════════════════════════════════════════════════════════════
 show_duplicate_details() {
   [[ $VERBOSE -eq 0 ]] && return
@@ -1169,22 +1026,19 @@ show_duplicate_details() {
           for f in "${arr[@]}"; do local p=$(echo "$f" | cut -d'|' -f1); local m=$(stat -c '%Y' -- "$p" 2>/dev/null || echo 0); echo "$m|$f"; done | sort -rn | cut -d'|' -f2- && printf '\0'
         ); arr=("${sorted_arr[@]}"); keep_idx=0
       elif [[ $KEEP_OLDEST -eq 1 ]]; then
-        # FIX START: Corrected pipeline for the for-loop to read into a variable correctly
-        IFS=$'\n' read -r -d '' -a sorted_arr < <(
-          for f in "${arr[@]}"; do
-            local p=$(echo "$f" | cut -d'|' -f1)
-            local m=$(stat -c '%Y' -- "$p" 2>/dev/null || echo 0)
-            echo "$m|$f"
-          done | sort -n | cut -d'|' -f2- && printf '\0'
-        )
-        arr=("${sorted_arr[@]}")
-        keep_idx=0
-        # FIX END
+        IFS=$'\n' read -r -d '' -a sorted_arr < <(
+          for f in "${arr[@]}"; do
+            local p=$(echo "$f" | cut -d'|' -f1)
+            local m=$(stat -c '%Y' -- "$p" 2>/dev/null || echo 0)
+            echo "$m|$f"
+          done | sort -n | cut -d'|' -f2- && printf '\0'
+        )
+        arr=("${sorted_arr[@]}")
+        keep_idx=0
       else
         IFS=$'\n' read -r -d '' -a arr < <(printf '%s\n' "${arr[@]}" | sort && printf '\0')
         keep_idx=0
       fi
-
       for i in "${!arr[@]}"; do
         local path size
         path=$(echo "${arr[$i]}" | cut -d'|' -f1)
@@ -1201,34 +1055,28 @@ show_duplicate_details() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ENHANCED INTERACTIVE MODE FUNCTIONS
-# Provides a step-by-step interactive interface for managing duplicate files.
 # ═══════════════════════════════════════════════════════════════════════════
 show_file_details() {
   local file="$1"
   local size="$2"
   local is_keep="$3"
-  
   if [[ ! -f "$file" ]]; then
     echo -e "${RED}    ⚠ File not found: $file${NC}"
     return
   fi
-  
   local mtime=$(stat -c '%Y' "$file" 2>/dev/null || echo 0)
   local mtime_human=$(date -d "@$mtime" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "Unknown")
   local perms=$(stat -c '%A' "$file" 2>/dev/null || echo "Unknown")
   local owner=$(stat -c '%U:%G' "$file" 2>/dev/null || echo "Unknown")
   local path_short="$file"
-  
   if [[ ${#file} -gt 80 ]]; then
     path_short="...${file: -75}"
   fi
-  
   local status_icons=""
   [[ "$is_keep" == "true" ]] && status_icons+="🔒 "
   is_critical_system_file "$file" && status_icons+="⚠️ "
   is_in_system_folder "$file" && status_icons+="🛡️ "
   [[ -x "$file" ]] && status_icons+="⚡ "
-  
   echo -e "    ${BOLD}📄 ${path_short}${NC}"
   echo -e "    ${CYAN}Size:${NC}     $(format_size "$size") ($size bytes)"
   echo -e "    ${CYAN}Modified:${NC} $mtime_human"
@@ -1243,7 +1091,6 @@ show_file_comparison() {
   local keep_size="$2"
   local dup_file="$3"
   local dup_size="$4"
-  
   echo -e "${WHITE}╭─────────────────────────────────────────────────────────╮${NC}"
   echo -e "${WHITE}│                   FILE COMPARISON                       │${NC}"
   echo -e "${WHITE}├─────────────────────────────────────────────────────────┤${NC}"
@@ -1260,7 +1107,6 @@ show_interactive_menu() {
   local total_groups="$2"
   local dup_file="$3"
   local freed_space="$4"
-  
   echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
   echo -e "${BOLD}  Interactive Mode - Group $group_num of $total_groups${NC}"
   echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
@@ -1273,7 +1119,7 @@ show_interactive_menu() {
   echo -e "${CYAN}  [k] Keep This${NC}  - Mark this file as the one to keep instead"
   echo -e "${MAGENTA}  [v] View${NC}       - Open file in default application"
   echo -e "${WHITE}  [i] Info${NC}       - Show detailed file information"
-  echo -e "${DIM}  [a] Apply to All${NC}- Apply current choice to remaining files"
+  echo -e "${DIM}  [a] Apply to All${NC}- Apply current choice to remaining duplicates"
   echo -e "${RED}  [q] Quit${NC}       - Stop processing and exit"
   echo ""
   echo -e "${DIM}Potential space savings: $(format_size "$freed_space")${NC}"
@@ -1320,8 +1166,6 @@ show_group_progress() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FILE OPERATIONS
-# Core functions for performing file actions like backup, deletion, and
-# hardlinking. This section also contains the main deletion logic.
 # ═══════════════════════════════════════════════════════════════════════════
 backup_file() {
   local file="$1"
@@ -1469,7 +1313,6 @@ delete_duplicates() {
           done
           if [[ "$choice" =~ ^[Ss]$ ]]; then echo -e "${GREEN}  ✓ Skipped: $path${NC}"; continue; fi
         elif [[ $INTERACTIVE_DELETE -eq 1 && $apply_to_all -eq 1 ]]; then
-          # Apply auto choice for non-interactive files in the loop
           local choice_auto="$auto_choice"
           if [[ "$choice_auto" =~ ^[Ss]$ ]]; then echo -e "${GREEN}  ✓ Skipped (auto): $path${NC}"; continue; fi
           if [[ "$choice_auto" =~ ^[Kk]$ ]]; then
@@ -1519,7 +1362,6 @@ delete_duplicates() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # REPORT GENERATION
-# Functions for creating detailed reports in HTML, CSV, and JSON formats.
 # ═══════════════════════════════════════════════════════════════════════════
 generate_html_report() {
   [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}📄 Generating HTML report...${NC}"
@@ -1670,8 +1512,6 @@ generate_json_report() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # EMAIL AND SUMMARY
-# Functions for sending email notifications and displaying the final scan
-# summary.
 # ═══════════════════════════════════════════════════════════════════════════
 calculate_duration() {
   local duration=$((SCAN_END_TIME - SCAN_START_TIME))
@@ -1745,7 +1585,6 @@ show_summary() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN EXECUTION
-# The main function orchestrates all operations in the correct sequence.
 # ═══════════════════════════════════════════════════════════════════════════
 main() {
   # Initialization and validation
@@ -1774,7 +1613,6 @@ main() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
-# Parses command-line arguments and begins the main execution loop.
 # ═══════════════════════════════════════════════════════════════════════════
 parse_arguments "$@"
 main
