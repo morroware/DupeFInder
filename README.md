@@ -1,6 +1,6 @@
 # DupeFinder Pro - Advanced Duplicate File Manager for Linux
 
-![DupeFinder Pro Logo](https://raw.githubusercontent.com/morroware/DupeFinder/main/logo.png)
+![DupeFinder Pro Logo](https://raw.githubusercontent.com/morroware/DupeFinder/logo.png)
 
 **DupeFinder Pro** is a powerful and versatile Bash script for finding and managing duplicate files on Linux systems.
 It goes beyond simple `find` and `md5sum` combinations, offering advanced features like multithreaded hashing, smart deletion strategies, caching, and comprehensive reporting.
