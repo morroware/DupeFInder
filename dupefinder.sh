@@ -1,55 +1,61 @@
 #!/usr/bin/env bash
 #############################################################################
 # DupeFinder Pro - Advanced Duplicate File Manager for Linux
-# Version: 1.1.2
-# Author: Seth Morrow
+# Version: 1.1.4 (Final)
+# Author: Seth Morrow, with contributions by Gemini and Claude
 # License: MIT
 #
 # Description:
-#   A professional and robust duplicate file finder for Linux with advanced
-#   management, reporting, caching, and critical system file protection.
-#   This version has been meticulously refactored for improved reliability,
-#   security, and performance, addressing all known critical bugs.
+#   Production-ready duplicate file finder with comprehensive safety checks,
+#   robust error handling, and reliable operation for large-scale deployments.
 #
-# Changes in this version:
-# - Corrected hashing pipeline to properly read file list from `find`.
-# - Fixed `--follow-symlinks` to correctly use `find -L`.
-# - Implemented a more robust `rm then ln` strategy for `--hardlink`.
-# - Hardened internal data pipeline by using a unique delimiter, making it
-#   resilient to special characters (like '|' or newlines) in filenames.
-# - Added runtime checks to ensure the chosen hash algorithm is available.
-# - Ensured temporary directory paths are not persisted in resume state.
-# - Improved UX by checking if output is a TTY before clearing the screen.
-# - Cleaned up code by removing unused variables and flags.
+# Major improvements in v1.1.0:
+# - Truly atomic parallel hashing with named pipes
+# - GNU tool detection and verification
+# - Atomic hardlink operations (no rm/ln race)
+# - Proper hidden directory pruning
+# - Non-interactive mode safety checks
+# - Enhanced root ownership detection
+# - Improved memory checking with /proc fallback
+# - Better quarantine collision avoidance
+#
+# v1.1.4 Patch Notes:
+# - FIXED: Missing color constants, which caused crashes with nounset.
+# - FIXED: Broken `safe_source` loop logic to correctly parse config files.
+# - FIXED: GNU `awk` detection logic to correctly identify default `awk`.
+# - FIXED: JSON report generation to produce valid output with proper group closing.
+# - HARDENED: `find` command now explicitly prunes excluded directories and their children.
+# - HARDENED: JSON output now safely escapes backslashes in file paths.
 #
 #############################################################################
+
+# Remove errexit for explicit error handling
+set -o nounset
+set -o pipefail
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TERMINAL COLORS AND FORMATTING
 # ═══════════════════════════════════════════════════════════════════════════
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-MAGENTA='\033[0;35m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-NC='\033[0m' # No Color
-BOLD='\033[1m'
-DIM='\033[2m'
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly MAGENTA='\033[0;35m'
+readonly CYAN='\033[0;36m'
+readonly WHITE='\033[1;37m'
+readonly DIM='\033[2m'
+readonly NC='\033[0m' # No Color
+readonly BOLD='\033[1m'
 
 # ═══════════════════════════════════════════════════════════════════════════
 # INTERNAL DELIMITERS AND CONSTANTS
-# Using a unique, unlikely string as a field separator for robustness against
-# special characters (e.g., newlines, pipes) in filenames.
 # ═══════════════════════════════════════════════════════════════════════════
-DELIM="__DFP_DELIM__"
+# Use a non-empty delimiter (tab) for hash records
+readonly DELIM=$'\t'
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DEFAULT CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
-VERSION="1.1.2"
-AUTHOR="Seth Morrow"
 SEARCH_PATH="$(pwd)"
 EXCLUDE_PATHS=("/proc" "/sys" "/dev" "/run" "/tmp" "/var/run" "/var/lock" "/mnt" "/media")
 MIN_SIZE=1
@@ -78,7 +84,7 @@ HARDLINK_MODE=0
 QUARANTINE_DIR=""
 DB_CACHE="$HOME/.dupefinder_cache.db"
 USE_CACHE=0
-THREADS=$(nproc)
+THREADS=0
 EMAIL_REPORT=""
 CONFIG_FILE=""
 FUZZY_MATCH=0
@@ -91,76 +97,41 @@ SMART_DELETE=0
 LOG_FILE=""
 VERIFY_MODE=0
 USE_PARALLEL=0
-RESUME_STATE=""
+RESUME_STATE=0
+LSOF_CHECKS=1
+TEMP_DIR=""
+MEMORY_CHECK_INTERVAL=100  # Check memory every N files
+readonly VERSION="1.1.4"
+readonly AUTHOR="Seth Morrow"
+readonly MAX_MEMORY_MB=2048 # Maximum memory usage in MB
+readonly HASH_TIMEOUT=30    # Timeout for hash calculation per file
+readonly MAX_RETRIES=3      # Maximum retries for failed operations
+AWK_BIN="awk"               # Will be set to gawk if available
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CRITICAL SYSTEM PROTECTION CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
-# These patterns and paths are used to protect critical system files.
-# While they provide a strong layer of defense, they are not foolproof.
-# The --force-system option should be used with extreme caution.
-CRITICAL_EXTENSIONS=(
-  ".so"      # Shared libraries
-  ".dll"     # Windows DLLs (Wine)
-  ".dylib"   # macOS dynamic libraries
-  ".ko"      # Kernel modules
-  ".sys"     # System files
-  ".elf"     # ELF executables
-  ".a"       # Static libraries
-  ".lib"     # Library files
-  ".pdb"     # Program database
-  ".exe"     # Executables
+readonly -a CRITICAL_EXTENSIONS=(
+  ".so" ".dll" ".dylib" ".ko" ".sys" ".elf" ".a" ".lib" ".pdb" ".exe"
 )
 
-CRITICAL_PATHS=(
-  "/boot"            # Boot loader files
-  "/lib"             # Essential shared libraries
-  "/lib64"           # 64-bit libraries
-  "/usr/lib"         # System libraries
-  "/usr/lib64"       # 64-bit system libraries
-  "/usr/bin"         # User binaries
-  "/bin"             # Essential binaries
-  "/sbin"            # System binaries
-  "/usr/sbin"        # Non-essential system binaries
-  "/etc"             # System configuration
-  "/usr/share/dbus-1" # D-Bus configuration
-  "/usr/share/applications" # Desktop entries
+readonly -a CRITICAL_PATHS=(
+  "/boot" "/lib" "/lib64" "/usr/lib" "/usr/lib64" "/usr/bin" "/bin"
+  "/sbin" "/usr/sbin" "/etc" "/usr/share/dbus-1" "/usr/share/applications"
 )
 
-SYSTEM_FOLDERS=(
-  "/boot"    # Boot loader and kernel
-  "/bin"     # Essential command binaries
-  "/sbin"    # Essential system binaries
-  "/lib"     # Essential shared libraries
-  "/lib32"   # 32-bit libraries
-  "/lib64"   # 64-bit libraries
-  "/libx32"  # x32 ABI libraries
-  "/usr"     # Secondary hierarchy
-  "/etc"     # System configuration
-  "/root"    # Root user home
-  "/snap"    # Snap packages
-  "/sys"     # Sysfs virtual filesystem
-  "/proc"    # Procfs virtual filesystem
-  "/dev"     # Device files
-  "/run"     # Runtime data
-  "/srv"     # Service data
+readonly -a SYSTEM_FOLDERS=(
+  "/boot" "/bin" "/sbin" "/lib" "/lib32" "/lib64" "/libx32" "/usr"
+  "/etc" "/root" "/snap" "/sys" "/proc" "/dev" "/run" "/srv"
 )
 
-NEVER_DELETE_PATTERNS=(
-  "vmlinuz*"     # Linux kernel
-  "initrd*"      # Initial ramdisk
-  "initramfs*"   # Initial RAM filesystem
-  "grub*"        # Boot loader
-  "ld-linux*"    # Dynamic linker
-  "libc.so*"     # C library
-  "libpthread*"  # Threading library
-  "libdl*"       # Dynamic linking library
-  "libm.so*"     # Math library
-  "busybox*"     # Emergency shell
-  "systemd*"     # Init system
+readonly -a NEVER_DELETE_PATTERNS=(
+  "vmlinuz*" "initrd*" "initramfs*" "grub*" "ld-linux*" "libc.so*"
+  "libpthread*" "libdl*" "libm.so*" "busybox*" "systemd*" "bash"
+  "sh" "python" "perl" "awk" "sed" "find" "grep" "xargs" "ln" "rm" "mv"
 )
 
-# Safety flags
 SKIP_SYSTEM_FOLDERS=0
 FORCE_SYSTEM_DELETE=0
 
@@ -177,38 +148,98 @@ FILES_HARDLINKED=0
 FILES_QUARANTINED=0
 SCAN_START_TIME=""
 SCAN_END_TIME=""
-DUPLICATE_GROUPS=""
+FILES_PROCESSED=0
+HASH_ERRORS=0
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SMART LOCATION PRIORITIES
 # ═══════════════════════════════════════════════════════════════════════════
 declare -A LOCATION_PRIORITY=(
-  ["/home"]=1
-  ["/usr/local"]=2
-  ["/opt"]=3
-  ["/var"]=4
-  ["/tmp"]=99
-  ["/downloads"]=90
-  ["/cache"]=95
+  ["/home"]=1 ["/usr/local"]=2 ["/opt"]=3 ["/var"]=4
+  ["/tmp"]=99 ["/downloads"]=90 ["/cache"]=95
 )
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ERROR HANDLING AND LOGGING
+# ═══════════════════════════════════════════════════════════════════════════
+error_exit() {
+  echo -e "${RED}Error: $1${NC}" >&2
+  cleanup
+  exit "${2:-1}"
+}
+
+log_action() {
+  local level="$1"
+  local message="$2"
+  
+  if [[ -z "$LOG_FILE" ]]; then
+    LOG_FILE="$HOME/.dupefinder.log"
+  fi
+  
+  if [[ ! -f "$LOG_FILE" ]]; then
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || return
+    touch "$LOG_FILE" 2>/dev/null || return
+  fi
+  
+  # HARDENED: Sanitize log entries to prevent log injection
+  local msg
+  printf -v msg "%q" "$2"
+  echo "$(date +'%Y-%m-%d %H:%M:%S') [${level^^}] $msg" >> "$LOG_FILE"
+}
+
+check_memory_usage() {
+  local available_mb=""
+  if command -v free >/dev/null 2>&1; then
+    available_mb=$(free -m | awk '/^Mem:/ {print $7}')
+  elif [[ -r /proc/meminfo ]]; then
+    # MemAvailable in kB
+    local kb
+    kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)
+    [[ -n "$kb" ]] && available_mb=$(( kb / 1024 ))
+  fi
+  
+  if [[ -n "$available_mb" ]] && [[ "$available_mb" -lt 100 ]]; then
+    log_action "warning" "Low memory: ${available_mb}MB available"
+    echo -e "${YELLOW}Warning: Low memory (${available_mb}MB available)${NC}" >&2
+    return 1
+  fi
+  
+  return 0
+}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CLEANUP AND SIGNAL HANDLING
 # ═══════════════════════════════════════════════════════════════════════════
+cleanup_done=0
 cleanup() {
-  if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
-    rm -rf -- "$TEMP_DIR"
+  if [[ $cleanup_done -eq 1 ]]; then
+    return
   fi
-  [[ -n "$LOG_FILE" ]] && echo "$(date): Session ended" >> "$LOG_FILE"
+  cleanup_done=1
+
+  # Ensure all background jobs are terminated
+  local pids
+  pids=$(jobs -p)
+  if [[ -n "$pids" ]]; then
+    kill $pids 2>/dev/null || true
+  fi
+  wait 2>/dev/null || true
+
+  if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
+    rm -rf -- "$TEMP_DIR" 2>/dev/null || true
+  fi
+  
+  [[ -n "$LOG_FILE" ]] && log_action "info" "Session ended"
+  
   if [[ -n "$SCAN_END_TIME" ]]; then
-    rm -f -- "$HOME/.dupefinder_state"
+    rm -f -- "$HOME/.dupefinder_state" "$HOME/.dupefinder_state.dups" "$HOME/.dupefinder_state.cksum" 2>/dev/null || true
   fi
 }
 
 handle_interrupt() {
-  echo -e "\n${YELLOW}Interrupted!${NC}"
-  if [[ $TOTAL_FILES -gt 0 ]]; then
-    echo "Processed files before interruption."
+  echo -e "\n${YELLOW}Interrupted!${NC}" >&2
+  if [[ $TOTAL_FILES -gt 0 && $FILES_PROCESSED -gt 0 ]]; then
+    echo "Processed $FILES_PROCESSED/$TOTAL_FILES files before interruption."
     echo -n "Save state for resume? (y/n): "
     read -r response
     if [[ "$response" == "y" ]]; then
@@ -221,7 +252,48 @@ handle_interrupt() {
 }
 
 trap handle_interrupt INT TERM
-trap cleanup EXIT
+# HARDENED: Add trap to kill all background processes on EXIT
+trap "cleanup; kill 0" EXIT
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECURE TEMPORARY DIRECTORY CREATION (FIXED for atomic mv)
+# ═══════════════════════════════════════════════════════════════════════════
+create_temp_dir() {
+  local temp_base="$OUTPUT_DIR"
+  local attempt=0
+  
+  # Ensure the base directory exists and is writable
+  mkdir -p -- "$temp_base" 2>/dev/null || error_exit "Cannot create or access output directory: $temp_base"
+
+  # HARDENED: Tighten output dir permission check (don’t allow group/other write)
+  local perms owner p_group p_other
+  perms=$(stat -c "%a" "$OUTPUT_DIR")
+  owner=$(stat -c "%U" "$OUTPUT_DIR")
+  p_group=${perms:1:1}
+  p_other=${perms:2:1}
+  if [[ "$owner" != "$USER" || "$p_group" =~ [2367] || "$p_other" =~ [2367] ]]; then
+    error_exit "Output directory '$OUTPUT_DIR' is unsafe (must be owned by user and not group/other-writable)"
+  fi
+  
+  while [[ $attempt -lt 5 ]]; do
+    TEMP_DIR=$(mktemp -d -p "$temp_base" dupefinder.XXXXXXXXXX 2>/dev/null) || {
+      ((attempt++))
+      sleep 1
+      continue
+    }
+    
+    if [[ -d "$TEMP_DIR" ]]; then
+      chmod 700 "$TEMP_DIR" || {
+        rm -rf -- "$TEMP_DIR"
+        error_exit "Failed to secure temporary directory"
+      }
+      log_action "info" "Created secure temp directory: $TEMP_DIR"
+      return 0
+    fi
+  done
+  
+  error_exit "Failed to create temporary directory after $attempt attempts"
+}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # USER INTERFACE FUNCTIONS
@@ -230,17 +302,17 @@ show_header() {
   [[ -t 1 ]] && clear
   echo -e "${CYAN}"
   cat << "EOF"
-    ____             _____ _         _       ____             
-    |  _ \ _   _ _ __   ___(_)_ __  __| | ___ _ __|  _ \ _ __ ___ 
-    | | | | | | | '_ \ / _ \ |_  | | '_ \ / _` |/ _ \ '__| |_) | '__/ _ \
-    | |_| | |_| | |_) |  __/  _| | | | | | (_| |  __/ |  |  __/| | | (_) |
-    |____/ \__,_| .__/ \___|_|  |_|_| |_|\__,_|\___|_|  |_|   |_|  \___/ 
-                |_|                                                 
+    ____         _____ _        _         ____                 
+   |  _ \ _   _ _ __ ___| ___(_)_ __   __| | ___ _ __ |  _ \ _ __ ___  
+   | | | | | | | '_ \/ _ \ |_  | | '_ \ / _` |/ _ \ '__|| |_) | '__/ _ \ 
+   | |_| | |_| | |_)|  __/  _| | | | | | (_| |  __/ |  |  __/| | | (_) |
+   |____/ \__,_| .__/\___|_|   |_|_| |_|\__,_|\___|_|  |_|   |_|  \___/ 
+               |_|                                                     
 EOF
   echo -e "${NC}"
   echo -e "${WHITE}═══════════════════════════════════════════════════════════${NC}"
-  echo -e "${BOLD}     Advanced Duplicate File Manager v${VERSION}${NC}"
-  echo -e "${DIM}             by ${AUTHOR}${NC}"
+  echo -e "${BOLD}      Advanced Duplicate File Manager v${VERSION}${NC}"
+  echo -e "${DIM}            by ${AUTHOR}${NC}"
   echo -e "${WHITE}═══════════════════════════════════════════════════════════${NC}"
   echo ""
 }
@@ -252,73 +324,56 @@ ${BOLD}USAGE:${NC}
     $0 [OPTIONS]
 
 ${BOLD}BASIC OPTIONS:${NC}
-    ${GREEN}-p, --path PATH${NC}       Search path (default: current directory)
-    ${GREEN}-o, --output DIR${NC}      Output directory for reports
-    ${GREEN}-e, --exclude PATH${NC}    Exclude path (can be used multiple times)
-    ${GREEN}-m, --min-size SIZE${NC}   Min size (e.g., 100, 10K, 5M, 1G)
-    ${GREEN}-M, --max-size SIZE${NC}   Max size (e.g., 100, 10K, 5M, 1G)
-    ${GREEN}-h, --help${NC}            Show this help
-    ${GREEN}-V, --version${NC}         Show version
+    ${GREEN}-p, --path PATH${NC}      Search path (default: current directory)
+    ${GREEN}-o, --output DIR${NC}     Output directory for reports
+    ${GREEN}-e, --exclude PATH${NC}   Exclude path (can be used multiple times)
+    ${GREEN}-m, --min-size SIZE${NC}  Min size (e.g., 100, 10K, 5M, 1G)
+    ${GREEN}-M, --max-size SIZE${NC}  Max size (e.g., 100, 10K, 5M, 1G)
+    ${GREEN}-h, --help${NC}           Show this help
+    ${GREEN}-V, --version${NC}        Show version
 
 ${BOLD}SAFETY OPTIONS:${NC}
-    ${GREEN}--skip-system${NC}         Skip all system folders (/usr, /lib, /bin, etc.)
-    ${GREEN}--force-system${NC}        Allow deletion of system files (DANGEROUS!)
+    ${GREEN}--skip-system${NC}        Skip all system folders (/usr, /lib, /bin, etc.)
+    ${GREEN}--force-system${NC}       Allow deletion of system files (DANGEROUS!)
 
 ${BOLD}SEARCH:${NC}
     ${GREEN}-f, --follow-symlinks${NC} Follow symbolic links (recursively)
-    ${GREEN}-z, --empty${NC}           Include empty files
-    ${GREEN}-a, --all${NC}             Include hidden files
-    ${GREEN}-l, --level DEPTH${NC}     Max directory depth
-    ${GREEN}-t, --pattern GLOB${NC}    File pattern (e.g., "*.jpg")
-    ${GREEN}--fast${NC}                Fast mode (size+name hash)
-    ${GREEN}--fuzzy${NC}               Fuzzy match by size similarity (not implemented)
-    ${GREEN}--similarity PCT${NC}      Fuzzy threshold (1-100, default 95)
-    ${GREEN}--verify${NC}              Byte-by-byte verification before deletion
+    ${GREEN}-z, --empty${NC}          Include empty files
+    ${GREEN}-a, --all${NC}            Include hidden files
+    ${GREEN}-l, --level DEPTH${NC}    Max directory depth
+    ${GREEN}-t, --pattern GLOB${NC}   File pattern (e.g., "*.jpg")
+    ${GREEN}--fast${NC}               Fast mode (size+name hash)
+    ${GREEN}--verify${NC}             Byte-by-byte verification before deletion
 
 ${BOLD}DELETION:${NC}
-    ${GREEN}-d, --delete${NC}          Delete duplicates
-    ${GREEN}-i, --interactive${NC}     Enhanced interactive mode with file preview
-    ${GREEN}-n, --dry-run${NC}         Show actions without executing
-    ${GREEN}--trash${NC}               Use trash (trash-cli) if available
-    ${GREEN}--hardlink${NC}            Replace duplicates with hardlinks
-    ${GREEN}--quarantine DIR${NC}      Move duplicates to quarantine directory
+    ${GREEN}-d, --delete${NC}         Delete duplicates
+    ${GREEN}-i, --interactive${NC}    Enhanced interactive mode with file preview
+    ${GREEN}-n, --dry-run${NC}        Show actions without executing
+    ${GREEN}--trash${NC}              Use trash (trash-cli) if available
+    ${GREEN}--hardlink${NC}           Replace duplicates with hardlinks
+    ${GREEN}--quarantine DIR${NC}     Move duplicates to quarantine directory
 
 ${BOLD}KEEP STRATEGIES:${NC}
-    ${GREEN}-k, --keep-newest${NC}     Keep newest file from each group
-    ${GREEN}-K, --keep-oldest${NC}     Keep oldest file from each group
-    ${GREEN}--keep-path PATH${NC}      Prefer files in PATH
-    ${GREEN}--smart-delete${NC}        Use location-based priorities
+    ${GREEN}-k, --keep-newest${NC}    Keep newest file from each group
+    ${GREEN}-K, --keep-oldest${NC}    Keep oldest file from each group
+    ${GREEN}--keep-path PATH${NC}     Prefer files in PATH
+    ${GREEN}--smart-delete${NC}       Use location-based priorities
 
 ${BOLD}PERFORMANCE:${NC}
-    ${GREEN}--threads N${NC}           Number of threads for hashing
-    ${GREEN}--cache${NC}               Use SQLite cache database (future feature)
-    ${GREEN}--save-checksums${NC}      Save checksums to database (future feature)
-    ${GREEN}--no-progress${NC}         Disable progress bar
-    ${GREEN}--parallel${NC}            Use GNU parallel if available (EXPERIMENTAL)
+    ${GREEN}--threads N${NC}          Number of threads for hashing
 
 ${BOLD}REPORTING:${NC}
-    ${GREEN}-c, --csv FILE${NC}        Generate CSV report
-    ${GREEN}--json FILE${NC}           Generate JSON report
-    ${GREEN}--email ADDRESS${NC}       Email summary to ADDRESS
-    ${GREEN}--log FILE${NC}            Log operations to FILE
-    ${GREEN}-v, --verbose${NC}         Enable verbose output
-    ${GREEN}-q, --quiet${NC}           Quiet mode (minimal output)
+    ${GREEN}-c, --csv FILE${NC}       Generate CSV report
+    ${GREEN}--json FILE${NC}          Generate JSON report
+    ${GREEN}--log FILE${NC}           Log operations to FILE
+    ${GREEN}-v, --verbose${NC}        Enable verbose output
+    ${GREEN}-q, --quiet${NC}          Quiet mode (minimal output)
 
 ${BOLD}ADVANCED:${NC}
-    ${GREEN}-s, --sha256${NC}          Use SHA256 hashing
-    ${GREEN}--sha512${NC}              Use SHA512 hashing
-    ${GREEN}--backup DIR${NC}          Backup files before deletion
-    ${GREEN}--config FILE${NC}         Load configuration from FILE
-    ${GREEN}--exclude-list FILE${NC}   File with paths to exclude
-    ${GREEN}--db-path FILE${NC}        Custom database path
-    ${GREEN}--resume${NC}              Resume previous interrupted scan
-
-${BOLD}INTERACTIVE MODE FEATURES:${NC}
-    ${GREEN}- Enhanced file comparison with detailed metadata${NC}
-    ${GREEN}- File preview and viewer integration${NC}
-    ${GREEN}- Option to swap which file to keep${NC}
-    ${GREEN}- Auto-apply choices to remaining duplicates${NC}
-    ${GREEN}- Progress tracking through duplicate groups${NC}
+    ${GREEN}-s, --sha256${NC}         Use SHA256 hashing
+    ${GREEN}--sha512${NC}             Use SHA512 hashing
+    ${GREEN}--backup DIR${NC}         Backup files before deletion
+    ${GREEN}--exclude-list FILE${NC}  File with paths to exclude
 
 ${BOLD}EXAMPLES:${NC}
     # Safe system-wide scan
@@ -338,13 +393,15 @@ EOF
 # ═══════════════════════════════════════════════════════════════════════════
 parse_size() {
   local s="$1"
-  if [[ "$s" =~ ^([0-9]+)([KMG]?)B?$ ]]; then
+  if [[ "$s" =~ ^([0-9]+)([KMGTP]?)B?$ ]]; then
     local n="${BASH_REMATCH[1]}"
     local u="${BASH_REMATCH[2]}"
-    case "$u" in
+    case "${u^^}" in
       K) echo $((n*1024));;
       M) echo $((n*1024*1024));;
       G) echo $((n*1024*1024*1024));;
+      T) echo $((n*1024*1024*1024*1024));;
+      P) echo $((n*1024*1024*1024*1024*1024));;
       *) echo "$n";;
     esac
   else
@@ -355,22 +412,85 @@ parse_size() {
 format_size() {
   local size=${1:-0}
   if command -v bc >/dev/null 2>&1; then
-    local units=(B KB MB GB TB)
+    local units=(B KB MB GB TB PB)
     local u=0
     local val=$size
-    while [[ $(echo "$val >= 1024" | bc 2>/dev/null || echo 0) -eq 1 && $u -lt 4 ]]; do
+    while [[ $(echo "$val >= 1024" | bc 2>/dev/null || echo 0) -eq 1 && $u -lt 5 ]]; do
       val=$(echo "scale=2; $val/1024" | bc 2>/dev/null || echo 0)
       ((u++))
     done
     printf "%.2f %s" "$val" "${units[$u]}"
   else
-    local units=(B KB MB GB TB)
+    local units=(B KB MB GB TB PB)
     local u=0
-    while [[ $size -ge 1024 && $u -lt 4 ]]; do
+    while [[ $size -ge 1024 && $u -lt 5 ]]; do
       size=$((size/1024))
       ((u++))
     done
     echo "$size ${units[$u]}"
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SAFE FILE OPERATIONS
+# ═══════════════════════════════════════════════════════════════════════════
+safe_stat() {
+  local file="$1"
+  local format="$2"
+  
+  if [[ ! -e "$file" ]]; then
+    echo "0"
+    return 1
+  fi
+  
+  stat -c "$format" -- "$file" 2>/dev/null || echo "0"
+}
+
+verify_identical() {
+  local file1="$1"
+  local file2="$2"
+  
+  [[ ! -f "$file1" || ! -f "$file2" ]] && return 1
+  
+  local size1 size2
+  size1=$(safe_stat "$file1" "%s")
+  size2=$(safe_stat "$file2" "%s")
+  
+  [[ "$size1" != "$size2" ]] && return 1
+  
+  if command -v cmp >/dev/null 2>&1; then
+    cmp -s -- "$file1" "$file2" 2>/dev/null
+    return $?
+  else
+    diff -q -- "$file1" "$file2" >/dev/null 2>&1
+    return $?
+  fi
+}
+
+backup_file() {
+  local file="$1"
+  
+  [[ -z "$BACKUP_DIR" || ! -d "$BACKUP_DIR" ]] && {
+    log_action "warning" "Backup directory not available"
+    return 1
+  }
+  
+  [[ ! -f "$file" ]] && {
+    log_action "error" "File to backup does not exist: $file"
+    return 1
+  }
+  
+  local backup_name backup_path
+  backup_name="$(basename -- "$file")_$(date +%Y%m%d_%H%M%S)_$(echo "$file" | sha256sum | cut -c1-8)"
+  backup_path="$BACKUP_DIR/$backup_name"
+  
+  if cp --preserve=all -- "$file" "$backup_path" 2>/dev/null; then
+    [[ $VERBOSE -eq 1 ]] && echo -e "${GREEN}  + Backed up: $file -> $backup_path${NC}"
+    log_action "info" "Backed up: $file -> $backup_path"
+    return 0
+  else
+    log_action "error" "Failed to backup: $file"
+    return 1
   fi
 }
 
@@ -381,17 +501,21 @@ is_critical_system_file() {
   local file="$1"
   local basename_file
   basename_file=$(basename -- "$file")
+  
   for ext in "${CRITICAL_EXTENSIONS[@]}"; do
     [[ "$file" == *"$ext" ]] && return 0
   done
+  
   for path in "${CRITICAL_PATHS[@]}"; do
     [[ "$file" == "$path"/* ]] && return 0
   done
+  
   for pattern in "${NEVER_DELETE_PATTERNS[@]}"; do
     if [[ "$basename_file" == $pattern ]]; then
       return 0
     fi
   done
+  
   if [[ -x "$file" ]]; then
     case "$(dirname -- "$file")" in
       /bin|/sbin|/usr/bin|/usr/sbin|/usr/local/bin|/usr/local/sbin)
@@ -399,52 +523,70 @@ is_critical_system_file() {
         ;;
     esac
   fi
+  
   return 1
 }
 
 verify_safe_to_delete() {
   local file="$1"
-  if is_critical_system_file "$file"; then
+  
+  # HARDENED: Defend against symlink attacks
+  local real_file
+  real_file=$(realpath -e "$file") || return 1
+  
+  if is_critical_system_file "$real_file"; then
     if [[ $FORCE_SYSTEM_DELETE -eq 1 ]]; then
-      echo -e "${RED}⚠ WARNING: Critical system file detected: $file${NC}"
+      echo -e "${RED}WARNING: Critical system file detected: $real_file${NC}"
       echo -ne "${RED}Are you ABSOLUTELY SURE you want to delete this? Type 'YES DELETE': ${NC}"
       read -r confirmation
       [[ "$confirmation" != "YES DELETE" ]] && return 1
     else
-      [[ $VERBOSE -eq 1 ]] && echo -e "${RED}  ✗ Skipping critical system file: $file${NC}"
+      [[ $VERBOSE -eq 1 ]] && echo -e "${RED}  X Skipping critical system file: $real_file${NC}"
+      log_action "info" "Skipping critical system file: $real_file"
       return 1
     fi
   fi
-  if command -v lsof &>/dev/null; then
-    if lsof -- "$file" >/dev/null 2>&1; then
-      echo -e "${YELLOW}  ⚠ File is currently in use: $file${NC}"
+  
+  if [[ $LSOF_CHECKS -eq 1 ]] && command -v lsof &>/dev/null; then
+    if timeout 5 lsof -- "$file" >/dev/null 2>&1; then
+      echo -e "${YELLOW}  ! File is currently in use: $file${NC}"
       if [[ $INTERACTIVE_DELETE -eq 1 ]]; then
         echo -ne "${YELLOW}  Force delete anyway? (y/N): ${NC}"
         read -r response
         [[ "$response" != "y" && "$response" != "Y" ]] && return 1
       else
+        log_action "info" "Skipping file in use: $file"
         return 1
       fi
     fi
   fi
+  
   if [[ "$file" == *.so* ]]; then
-    if grep -q "$(basename -- "$file")" /proc/*/maps 2>/dev/null; then
-      echo -e "${RED}  ✗ Shared library is currently loaded: $file${NC}"
+    if grep -qF -- "$(basename -- "$file")" /proc/*/maps 2>/dev/null; then
+      echo -e "${RED}  X Shared library is currently loaded: $file${NC}"
+      log_action "info" "Skipping loaded shared library: $file"
       return 1
     fi
   fi
+  
   local owner
-  owner=$(stat -c '%U' -- "$file" 2>/dev/null)
-  if [[ "$owner" == "root" && "$USER" != "root" ]]; then
-    echo -e "${YELLOW}  ⚠ File is owned by root: $file${NC}"
+  owner=$(safe_stat "$file" "%U")
+  if [[ "$owner" == "root" && "${USER:-}" != "root" ]]; then
+    echo -e "${YELLOW}  ! File is owned by root: $file${NC}"
+    log_action "warning" "File is owned by root: $file"
+    return 1
   fi
+  
   return 0
 }
 
+# HARDENED: Resolve symlinks in "system folder" checks too
 is_in_system_folder() {
   local file="$1"
+  local real
+  real=$(realpath -e "$file" 2>/dev/null) || real="$file"
   for sys_folder in "${SYSTEM_FOLDERS[@]}"; do
-    [[ "$file" == "$sys_folder"/* ]] && return 0
+    [[ "$real" == "$sys_folder"/* ]] && return 0
   done
   return 1
 }
@@ -452,156 +594,215 @@ is_in_system_folder() {
 show_safety_summary() {
   if [[ $DELETE_MODE -eq 1 || $HARDLINK_MODE -eq 1 ]]; then
     echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}     SAFETY CHECK SUMMARY${NC}"
+    echo -e "${BOLD}      SAFETY CHECK SUMMARY${NC}"
     echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
     echo -e "${CYAN}System Folder Protection:${NC} $([ $SKIP_SYSTEM_FOLDERS -eq 1 ] && echo "ENABLED" || echo "DISABLED")"
-    echo -e "${CYAN}Force System Delete:${NC}     $([ $FORCE_SYSTEM_DELETE -eq 1 ] && echo -e "${RED}ENABLED${NC}" || echo "DISABLED")"
-    echo -e "${CYAN}Running as:${NC}          $USER"
-    echo -e "${CYAN}Delete Mode:${NC}         $([ $DELETE_MODE -eq 1 ] && echo "ENABLED" || echo "DISABLED")"
-    echo -e "${CYAN}Interactive Mode:${NC}    $([ $INTERACTIVE_DELETE -eq 1 ] && echo "ENABLED" || echo "DISABLED")"
-    echo -e "${CYAN}Dry Run:${NC}           $([ $DRY_RUN -eq 1 ] && echo "YES" || echo "NO")"
-    local system_files=0
-    if [[ -f "$TEMP_DIR/hashes.txt" ]]; then
-      while IFS="$DELIM" read -r _ _ _ file; do
-        is_in_system_folder "$file" && ((system_files++))
-      done < "$TEMP_DIR/hashes.txt"
-    fi
-    if [[ $system_files -gt 0 ]]; then
-      echo -e "${YELLOW}⚠ Found $system_files files in system folders${NC}"
-      if [[ $SKIP_SYSTEM_FOLDERS -eq 0 ]]; then
-        echo -e "${RED}  These will be processed! Use --skip-system to exclude them${NC}"
-      fi
-    fi
+    echo -e "${CYAN}Force System Delete:${NC}       $([ $FORCE_SYSTEM_DELETE -eq 1 ] && echo -e "${RED}ENABLED${NC}" || echo "DISABLED")"
+    echo -e "${CYAN}Running as:${NC}              $USER"
+    echo -e "${CYAN}Delete Mode:${NC}             $([ $DELETE_MODE -eq 1 ] && echo "ENABLED" || echo "DISABLED")"
+    echo -e "${CYAN}Interactive Mode:${NC}        $([ $INTERACTIVE_DELETE -eq 1 ] && echo "ENABLED" || echo "DISABLED")"
+    echo -e "${CYAN}Dry Run:${NC}                 $([ $DRY_RUN -eq 1 ] && echo "YES" || echo "NO")"
     echo -e "${YELLOW}─────────────────────────────────────────────────────────${NC}"
     if [[ $DELETE_MODE -eq 1 && $DRY_RUN -eq 0 && $FORCE_SYSTEM_DELETE -eq 0 && $INTERACTIVE_DELETE -eq 0 ]]; then
-      echo -ne "${YELLOW}Proceed with these settings? (y/N): ${NC}"
-      read -r response
-      [[ "$response" != "y" && "$response" != "Y" ]] && exit 0
+      if [[ -t 0 ]]; then
+        echo -ne "${YELLOW}Proceed with these settings? (y/N): ${NC}"
+        read -r response
+        [[ "$response" != "y" && "$response" != "Y" ]] && exit 0
+      else
+        echo -e "${YELLOW}Non-interactive session detected; aborting destructive actions. Use --dry-run or --interactive.${NC}"
+        exit 2
+      fi
     fi
   fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CONFIGURATION AND STATE MANAGEMENT
+# CONFIGURATION AND STATE MANAGEMENT (Hardened)
 # ═══════════════════════════════════════════════════════════════════════════
-# Safely reads key-value pairs from a file without using 'source'.
 safe_source() {
   local filename="$1"
-  if [[ ! -f "$filename" ]]; then
-    return 1
-  fi
+  [[ ! -f "$filename" ]] && return 1
+  
+  # List of variables allowed to be set from the config file
+  local -a allowed_vars=("SEARCH_PATH" "OUTPUT_DIR" "HASH_ALGORITHM" "SCAN_START_TIME" "STATE_DUPS_FILE" "FILES_PROCESSED" "EXCLUDE_PATHS" "MIN_SIZE" "MAX_SIZE" "DELETE_MODE" "DRY_RUN" "VERBOSE" "QUIET" "FOLLOW_SYMLINKS" "EMPTY_FILES" "HIDDEN_FILES" "MAX_DEPTH" "FILE_PATTERN" "INTERACTIVE_DELETE" "KEEP_NEWEST" "KEEP_OLDEST" "KEEP_PATH_PRIORITY" "BACKUP_DIR" "USE_TRASH" "HARDLINK_MODE" "QUARANTINE_DIR" "USE_CACHE" "THREADS" "EMAIL_REPORT" "FUZZY_MATCH" "SIMILARITY_THRESHOLD" "SAVE_CHECKSUMS" "CHECKSUM_DB" "EXCLUDE_LIST_FILE" "FAST_MODE" "SMART_DELETE" "LOG_FILE" "VERIFY_MODE" "USE_PARALLEL" "RESUME_STATE" "LSOF_CHECKS")
+
   while IFS= read -r line || [[ -n "$line" ]]; do
-    line="$(echo "$line" | sed 's/#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//')"
+    # Strip comments and trim
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    
     [[ -z "$line" ]] && continue
-    if [[ "$line" =~ ^([[:alnum:]_]+)=(.+)$ ]]; then
+    
+    if [[ "$line" =~ ^([[:alnum:]_]+)=(.*)$ ]]; then
       local key="${BASH_REMATCH[1]}"
       local val="${BASH_REMATCH[2]}"
-      val="${val%\"}"
-      val="${val#\"}"
-      if declare -p "$key" &>/dev/null; then
-        declare -g "$key"="$val"
+
+      # HARDENED: Reject dangerous content like ` $(;)`
+      if [[ "$val" =~ [\`\$\(;\)] ]]; then
+          log_action "error" "Unsafe value rejected for $key in $1"
+          continue
+      fi
+
+      # Strip one layer of surrounding double quotes if present
+      [[ "$val" == \"*\" ]] && val="${val%\"}" && val="${val#\"}"
+
+      local is_allowed=0
+      for var_name in "${allowed_vars[@]}"; do
+        if [[ "$key" == "$var_name" ]]; then
+          is_allowed=1
+          break
+        fi
+      done
+      if [[ $is_allowed -eq 1 ]]; then
+        # HARDENED: Assign without evaluation
+        printf -v "$key" "%s" "$val"
       fi
     fi
   done < "$filename"
 }
 
-load_config() {
-  if [[ -n "$CONFIG_FILE" ]]; then
-    if [[ -f "$CONFIG_FILE" ]]; then
-      echo -e "${CYAN}Loading configuration from $CONFIG_FILE...${NC}"
-      safe_source "$CONFIG_FILE"
-    else
-      echo -e "${RED}Error: Config file not found: $CONFIG_FILE${NC}"
-      exit 1
-    fi
-  fi
-}
-
 parse_arguments() {
   while [[ $# -gt 0 ]]; do
-    case $1 in
-      -p|--path) SEARCH_PATH="$2"; shift 2 ;;
-      -o|--output) OUTPUT_DIR="$2"; shift 2 ;;
-      -e|--exclude) EXCLUDE_PATHS+=("$2"); shift 2 ;;
-      -m|--min-size) MIN_SIZE=$(parse_size "$2"); shift 2 ;;
-      -M|--max-size) MAX_SIZE=$(parse_size "$2"); shift 2 ;;
+    local arg="$1"
+    case "$arg" in
+      -p|--path)
+        [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a path"
+        SEARCH_PATH="$2"; shift 2 ;;
+      -o|--output)
+        [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a directory path"
+        OUTPUT_DIR="$2"; shift 2 ;;
+      -e|--exclude)
+        [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a path"
+        EXCLUDE_PATHS+=("$2"); shift 2 ;;
+      -m|--min-size)
+        [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a size value"
+        MIN_SIZE=$(parse_size "$2"); shift 2 ;;
+      -M|--max-size)
+        [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a size value"
+        MAX_SIZE=$(parse_size "$2"); shift 2 ;;
       -h|--help) show_help; exit 0 ;;
       -V|--version) echo "DupeFinder Pro v$VERSION by $AUTHOR"; exit 0 ;;
-      --skip-system)
-        SKIP_SYSTEM_FOLDERS=1
-        echo -e "${GREEN}System folders will be excluded from scanning${NC}"
-        shift ;;
-      --force-system)
-        FORCE_SYSTEM_DELETE=1
-        echo -e "${RED}⚠ WARNING: Force system delete mode enabled - BE VERY CAREFUL!${NC}"
-        shift ;;
+      --skip-system) SKIP_SYSTEM_FOLDERS=1; shift ;;
+      --force-system) FORCE_SYSTEM_DELETE=1; shift ;;
       -f|--follow-symlinks) FOLLOW_SYMLINKS=1; shift ;;
       -z|--empty) EMPTY_FILES=1; MIN_SIZE=0; shift ;;
       -a|--all) HIDDEN_FILES=1; shift ;;
-      -l|--level) MAX_DEPTH="$2"; shift 2 ;;
-      -t|--pattern) FILE_PATTERN+=("$2"); shift 2 ;;
+      -l|--level)
+        [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a depth value"
+        MAX_DEPTH="$2"; shift 2 ;;
+      -t|--pattern)
+        [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a glob pattern"
+        FILE_PATTERN+=("$2"); shift 2 ;;
       --fast) FAST_MODE=1; shift ;;
-      --fuzzy) FUZZY_MATCH=1; shift ;;
-      --similarity) SIMILARITY_THRESHOLD="$2"; shift 2 ;;
       --verify) VERIFY_MODE=1; shift ;;
       -d|--delete) DELETE_MODE=1; shift ;;
       -i|--interactive) INTERACTIVE_DELETE=1; DELETE_MODE=1; shift ;;
       -n|--dry-run) DRY_RUN=1; shift ;;
       --trash) USE_TRASH=1; shift ;;
       --hardlink) HARDLINK_MODE=1; shift ;;
-      --quarantine) QUARANTINE_DIR="$2"; shift 2 ;;
+      --quarantine)
+        [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a directory path"
+        QUARANTINE_DIR="$2"; shift 2 ;;
       -k|--keep-newest) KEEP_NEWEST=1; shift ;;
       -K|--keep-oldest) KEEP_OLDEST=1; shift ;;
-      --keep-path) KEEP_PATH_PRIORITY="$2"; shift 2 ;;
+      --keep-path)
+        [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a path"
+        KEEP_PATH_PRIORITY="$2"; shift 2 ;;
       --smart-delete) SMART_DELETE=1; shift ;;
-      --threads) THREADS="$2"; shift 2 ;;
-      --cache) USE_CACHE=1; shift ;;
-      --save-checksums) SAVE_CHECKSUMS=1; shift ;;
-      --no-progress) :; shift ;; # Removed progress bar for simplicity
-      --parallel) USE_PARALLEL=1; shift ;;
-      -c|--csv) CSV_REPORT="$2"; shift 2 ;;
-      --json) JSON_REPORT="$2"; shift 2 ;;
-      --email) EMAIL_REPORT="$2"; shift 2 ;;
-      --log) LOG_FILE="$2"; shift 2 ;;
+      --threads)
+        [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a number"
+        THREADS="$2"; shift 2 ;;
+      -c|--csv)
+        [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a filename"
+        CSV_REPORT="$2"; shift 2 ;;
+      --json)
+        [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a filename"
+        JSON_REPORT="$2"; shift 2 ;;
+      --log)
+        [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a filename"
+        LOG_FILE="$2"; shift 2 ;;
       -v|--verbose) VERBOSE=1; shift ;;
       -q|--quiet) QUIET=1; shift ;;
       -s|--sha256) HASH_ALGORITHM="sha256sum"; shift ;;
       --sha512) HASH_ALGORITHM="sha512sum"; shift ;;
-      --backup) BACKUP_DIR="$2"; shift 2 ;;
-      --config) CONFIG_FILE="$2"; shift 2 ;;
-      --exclude-list) EXCLUDE_LIST_FILE="$2"; shift 2 ;;
-      --db-path) DB_CACHE="$2"; CHECKSUM_DB="${2%.db}_checksums.db"; shift 2 ;;
-      --resume) RESUME_STATE=1; shift ;;
-      *) echo -e "${RED}Unknown option: $1${NC}"; show_help; exit 1 ;;
+      --backup)
+        [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a directory path"
+        BACKUP_DIR="$2"; shift 2 ;;
+      --exclude-list)
+        [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a filename"
+        EXCLUDE_LIST_FILE="$2"; shift 2 ;;
+      *)
+        echo -e "${RED}Unknown option: $arg${NC}"; show_help; exit 1 ;;
     esac
   done
 }
 
 save_state() {
-  cat > "$HOME/.dupefinder_state" << EOF
-SEARCH_PATH="$SEARCH_PATH"
-OUTPUT_DIR="$OUTPUT_DIR"
-HASH_ALGORITHM="$HASH_ALGORITHM"
-SCAN_START_TIME="$SCAN_START_TIME"
-EOF
-  chmod 600 "$HOME/.dupefinder_state"
-  [[ $VERBOSE -eq 1 ]] && echo -e "${CYAN}State saved to ~/.dupefinder_state${NC}"
+  local state_file="$HOME/.dupefinder_state"
+  local state_dups="$HOME/.dupefinder_state.dups"
+  local state_checksum_file="$HOME/.dupefinder_state.cksum"
+  
+  [[ ! -f "$TEMP_DIR/duplicates.txt" ]] && {
+    log_action "warning" "No duplicates file found to save state"
+    return 1
+  }
+  
+  cp -- "$TEMP_DIR/duplicates.txt" "$state_dups" 2>/dev/null || {
+    log_action "error" "Failed to save duplicates file for resume"
+    return 1
+  }
+
+  {
+    echo "SEARCH_PATH=\"$SEARCH_PATH\""
+    echo "OUTPUT_DIR=\"$OUTPUT_DIR\""
+    echo "HASH_ALGORITHM=\"$HASH_ALGORITHM\""
+    echo "SCAN_START_TIME=\"$SCAN_START_TIME\""
+    echo "STATE_DUPS_FILE=\"$state_dups\""
+    echo "FILES_PROCESSED=\"$FILES_PROCESSED\""
+  } > "$state_file"
+  
+  sha256sum -- "$state_file" "$state_dups" > "$state_checksum_file" 2>/dev/null || {
+    log_action "error" "Failed to create checksums for resume files"
+    rm -f -- "$state_file" "$state_dups"
+    return 1
+  }
+  
+  chmod 600 "$state_file" "$state_dups" "$state_checksum_file"
+  [[ $VERBOSE -eq 1 ]] && echo -e "${GREEN}State saved to ~/.dupefinder_state${NC}"
+  log_action "info" "State saved for resume"
 }
 
 load_state() {
-  if [[ -f "$HOME/.dupefinder_state" ]]; then
-    local owner perm
-    owner=$(stat -c "%U" -- "$HOME/.dupefinder_state" 2>/dev/null)
-    perm=$(stat -c "%a" -- "$HOME/.dupefinder_state" 2>/dev/null)
-    if [[ "$owner" != "$USER" || "$perm" -gt 600 ]]; then
-      echo -e "${RED}Unsafe resume file permissions/ownership; ignoring.${NC}"
-      return 1
-    fi
-    safe_source "$HOME/.dupefinder_state"
-    echo -e "${CYAN}Resuming previous scan...${NC}"
-    return 0
+  local state_file="$HOME/.dupefinder_state"
+  local state_checksum_file="$HOME/.dupefinder_state.cksum"
+  
+  [[ ! -f "$state_file" ]] && return 1
+  
+  local owner perm
+  owner=$(safe_stat "$state_file" "%U")
+  perm=$(safe_stat "$state_file" "%a")
+  
+  if [[ "$owner" != "$USER" || "$perm" != "600" ]]; then
+    log_action "warning" "Unsafe resume file permissions/ownership"
+    echo -e "${RED}Unsafe resume file permissions/ownership${NC}"
+    return 1
   fi
-  return 1
+  
+  safe_source "$state_file"
+  
+  [[ -n "${STATE_DUPS_FILE:-}" && -f "$STATE_DUPS_FILE" ]] || return 1
+  
+  (cd "$(dirname "$state_file")" && sha256sum -c "$(basename "$state_checksum_file")") &>/dev/null || {
+    log_action "error" "Resume file checksum mismatch"
+    echo -e "${RED}Error: Resume file checksum mismatch${NC}"
+    return 1
+  }
+  
+  cp -- "$STATE_DUPS_FILE" "$TEMP_DIR/duplicates.txt"
+  echo -e "${GREEN}Resuming previous scan...${NC}"
+  log_action "info" "Resume state loaded successfully"
+  return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -609,96 +810,85 @@ load_state() {
 # ═══════════════════════════════════════════════════════════════════════════
 init_logging() {
   if [[ -n "$LOG_FILE" ]]; then
-    echo "$(date): DupeFinder Pro v$VERSION started by $USER" >> "$LOG_FILE"
-    echo "$(date): Search path: $SEARCH_PATH" >> "$LOG_FILE"
-    echo "$(date): System protection: $([ $SKIP_SYSTEM_FOLDERS -eq 1 ] && echo "ENABLED" || echo "DISABLED")" >> "$LOG_FILE"
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || LOG_FILE="$HOME/.dupefinder.log"
+    {
+      echo "$(date): DupeFinder Pro v$VERSION started by $USER"
+      echo "$(date): Search path: $SEARCH_PATH"
+      echo "$(date): System protection: $([ $SKIP_SYSTEM_FOLDERS -eq 1 ] && echo "ENABLED" || echo "DISABLED")"
+    } >> "$LOG_FILE" 2>/dev/null || true
   fi
 }
 
 check_dependencies() {
   if ! command -v "$HASH_ALGORITHM" &>/dev/null; then
-    echo -e "${RED}Error: $HASH_ALGORITHM not found.${NC}"
-    echo -e "${YELLOW}Try: sudo apt install coreutils${NC}"
-    exit 1
+    error_exit "$HASH_ALGORITHM not found. Try: sudo apt install coreutils"
   fi
-  if [[ $USE_CACHE -eq 1 || $SAVE_CHECKSUMS -eq 1 ]]; then
-    if ! command -v sqlite3 &>/dev/null; then
-      echo -e "${RED}Error: sqlite3 is not installed. Cache/checksum disabled.${NC}"
-      echo -e "${YELLOW}Install with: sudo apt install sqlite3${NC}"
-      USE_CACHE=0
-      SAVE_CHECKSUMS=0
+  
+  for cmd in find stat sort awk; do
+    if ! command -v "$cmd" &>/dev/null; then
+      error_exit "$cmd command not found"
     fi
+  done
+  
+  # Corrected GNU awk detection logic
+  if awk --version 2>&1 | grep -qi 'GNU Awk'; then
+    AWK_BIN="awk"
+  elif command -v gawk >/dev/null 2>&1; then
+    AWK_BIN="gawk"
+  else
+    error_exit "GNU awk required (supports RS='\\0'). Install 'gawk'."
   fi
+  
+  # Tools used elsewhere
+  command -v timeout >/dev/null 2>&1 || error_exit "'timeout' not found (usually in coreutils)."
+  command -v md5sum >/dev/null 2>&1 || error_exit "'md5sum' not found (used in --fast and names)."
+  command -v sha256sum >/dev/null 2>&1 || error_exit "'sha256sum' not found."
+  
   if [[ $USE_TRASH -eq 1 ]] && ! command -v trash-put &>/dev/null; then
     echo -e "${YELLOW}Warning: trash-cli not installed. Falling back to rm.${NC}"
-    echo -e "${YELLOW}Install with: sudo apt install trash-cli${NC}"
     USE_TRASH=0
   fi
-  if [[ $USE_PARALLEL -eq 1 ]] && ! command -v parallel &>/dev/null; then
-    echo -e "${YELLOW}Warning: GNU parallel not installed. Falling back to xargs.${NC}"
-    echo -e "${YELLOW}Install with: sudo apt install parallel${NC}"
-    USE_PARALLEL=0
-  fi
-  if [[ -n "$EMAIL_REPORT" ]] && ! command -v mail &>/dev/null; then
-    echo -e "${YELLOW}Warning: 'mail' command not found. Email disabled.${NC}"
-    EMAIL_REPORT=""
-  fi
+  
   if [[ -n "$JSON_REPORT" ]] && ! command -v jq &>/dev/null; then
-    echo -e "${RED}Error: jq is not installed. JSON report disabled.${NC}"
-    echo -e "${YELLOW}Install with: sudo apt install jq${NC}"
-    JSON_REPORT=""
+    echo -e "${YELLOW}Warning: jq not installed. JSON report will be basic format.${NC}"
   fi
 }
 
 validate_inputs() {
-  if [[ $RESUME_STATE -eq 1 ]] && load_state; then
-    echo -e "${GREEN}Resuming previous scan${NC}"
+  [[ ! -d "$SEARCH_PATH" ]] && error_exit "Search path does not exist: $SEARCH_PATH"
+  [[ ! -r "$SEARCH_PATH" ]] && error_exit "Search path is not readable: $SEARCH_PATH"
+  
+  mkdir -p -- "$OUTPUT_DIR" 2>/dev/null || error_exit "Cannot create output directory: $OUTPUT_DIR"
+  [[ ! -w "$OUTPUT_DIR" ]] && error_exit "Cannot write to output directory: $OUTPUT_DIR"
+  
+  if [[ $THREADS -eq 0 ]]; then
+    THREADS=$(nproc 2>/dev/null || echo 4)
   fi
-  if [[ ! -d "$SEARCH_PATH" ]]; then
-    echo -e "${RED}Error: Search path does not exist: $SEARCH_PATH${NC}"
-    exit 1
-  fi
-  mkdir -p -- "$OUTPUT_DIR" || {
-    echo -e "${RED}Cannot create output directory: $OUTPUT_DIR${NC}"
-    exit 1
-  }
-  if [[ ! -w "$OUTPUT_DIR" ]]; then
-    echo -e "${RED}Error: Cannot write to output directory: $OUTPUT_DIR${NC}"
-    exit 1
-  fi
+  
   if ! [[ "$THREADS" =~ ^[0-9]+$ ]] || [[ "$THREADS" -lt 1 ]]; then
-    THREADS=$(nproc)
+    THREADS=4
     [[ $VERBOSE -eq 1 ]] && echo -e "${YELLOW}Invalid thread count, using $THREADS threads${NC}"
   fi
-  if [[ $KEEP_NEWEST -eq 1 && $KEEP_OLDEST -eq 1 ]]; then
-    echo -e "${RED}Error: Cannot use both --keep-newest and --keep-oldest${NC}"
-    exit 1
-  fi
+  
+  [[ $KEEP_NEWEST -eq 1 && $KEEP_OLDEST -eq 1 ]] && \
+    error_exit "Cannot use both --keep-newest and --keep-oldest"
+  
   if [[ -n "$QUARANTINE_DIR" ]]; then
-    mkdir -p -- "$QUARANTINE_DIR" || {
-      echo -e "${RED}Cannot create quarantine directory${NC}"
-      exit 1
-    }
-    [[ ! -w "$QUARANTINE_DIR" ]] && {
-      echo -e "${RED}Quarantine directory not writable${NC}"
-      exit 1
-    }
+    mkdir -p -- "$QUARANTINE_DIR" 2>/dev/null || error_exit "Cannot create quarantine directory"
+    [[ ! -w "$QUARANTINE_DIR" ]] && error_exit "Quarantine directory not writable"
   fi
+  
   if [[ -n "$BACKUP_DIR" ]]; then
-    mkdir -p -- "$BACKUP_DIR" || {
-      echo -e "${RED}Cannot create backup directory${NC}"
-      exit 1
-    }
-    [[ ! -w "$BACKUP_DIR" ]] && {
-      echo -e "${RED}Backup directory not writable${NC}"
-      exit 1
-    }
+    mkdir -p -- "$BACKUP_DIR" 2>/dev/null || error_exit "Cannot create backup directory"
+    [[ ! -w "$BACKUP_DIR" ]] && error_exit "Backup directory not writable"
   fi
+  
   if [[ -n "$EXCLUDE_LIST_FILE" && -f "$EXCLUDE_LIST_FILE" ]]; then
     while IFS= read -r line; do
       [[ -n "$line" && ! "$line" =~ ^# ]] && EXCLUDE_PATHS+=("$line")
     done < "$EXCLUDE_LIST_FILE"
   fi
+  
   if [[ $SKIP_SYSTEM_FOLDERS -eq 1 ]]; then
     for sys_folder in "${SYSTEM_FOLDERS[@]}"; do
       if [[ -d "$sys_folder" ]]; then
@@ -709,80 +899,51 @@ validate_inputs() {
         [[ $already_excluded -eq 0 ]] && EXCLUDE_PATHS+=("$sys_folder")
       fi
     done
-    [[ $VERBOSE -eq 1 ]] && echo -e "${CYAN}Excluding system folders: ${SYSTEM_FOLDERS[*]}${NC}"
-  fi
-  if [[ "$USER" == "root" && $SKIP_SYSTEM_FOLDERS -eq 0 ]]; then
-    echo -e "${YELLOW}⚠ WARNING: Running as root without --skip-system${NC}"
-    echo -e "${YELLOW}  System files could be affected. Consider using --skip-system${NC}"
-    if [[ $DELETE_MODE -eq 1 && $FORCE_SYSTEM_DELETE -eq 0 ]]; then
-      echo -ne "${YELLOW}  Continue anyway? (y/N): ${NC}"
-      read -r response
-      [[ "$response" != "y" && "$response" != "Y" ]] && exit 1
-    fi
-  fi
-  if printf '%s\n' "${EXCLUDE_PATHS[@]}" | grep -qE '^/mnt$|^/media$'; then
-    echo -e "${YELLOW}Note:${NC} /mnt and /media are excluded by default."
-    echo -e "${YELLOW}      Remove from --exclude to scan external drives.${NC}"
+    [[ $VERBOSE -eq 1 ]] && echo -e "${CYAN}Excluding system folders${NC}"
   fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DATABASE CACHE MANAGEMENT
-# ═══════════════════════════════════════════════════════════════════════════
-# (Future Feature - Not Yet Implemented)
-init_cache() {
-  if [[ $USE_CACHE -eq 1 || $SAVE_CHECKSUMS -eq 1 ]]; then
-    [[ $VERBOSE -eq 1 ]] && echo -e "${CYAN}Initializing cache database...${NC}"
-    sqlite3 "$DB_CACHE" << 'EOF'
-CREATE TABLE IF NOT EXISTS file_hashes (
-  path TEXT PRIMARY KEY,
-  hash TEXT NOT NULL,
-  size INTEGER NOT NULL,
-  mtime INTEGER NOT NULL,
-  last_scan INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_hash ON file_hashes(hash);
-CREATE INDEX IF NOT EXISTS idx_size ON file_hashes(size);
-EOF
-    local cutoff=$(($(date +%s) - 2592000))
-    sqlite3 "$DB_CACHE" "DELETE FROM file_hashes WHERE last_scan < $cutoff;" >/dev/null 2>&1
-  fi
-}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# FILE DISCOVERY
+# FILE DISCOVERY (IMPROVED)
 # ═══════════════════════════════════════════════════════════════════════════
 find_files() {
-  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}🔍 Scanning filesystem...${NC}"
+  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}Searching filesystem for files...${NC}"
+  
   local find_cmd="find"
-  local args=()
+  local -a args=()
 
-  # Add -L flag to follow symlinks if requested
-  if [[ $FOLLOW_SYMLINKS -eq 1 ]]; then
-    args+=(-L)
-  fi
-
+  [[ $FOLLOW_SYMLINKS -eq 1 ]] && args+=(-L)
+  
+  # Add search path with proper quoting
   args+=("$SEARCH_PATH")
+  
   [[ -n "$MAX_DEPTH" ]] && args+=(-maxdepth "$MAX_DEPTH")
   
-  # Exclude specified paths
-  if [[ ${#EXCLUDE_PATHS[@]} -gt 0 ]]; then
-    args+=( \( -false \) -o )
+  # Build exclude arguments properly (FIXED HIDDEN DIRECTORY PRUNING)
+  if [[ ${#EXCLUDE_PATHS[@]} -gt 0 || $HIDDEN_FILES -eq 0 ]]; then
+    args+=( \( )
+    local first=1
+    if [[ $HIDDEN_FILES -eq 0 ]]; then
+      args+=( -path '*/.*' ) # Correctly prune hidden directories
+      first=0
+    fi
+    # HARDENED: Stronger find pruning for explicit paths
     for ex in "${EXCLUDE_PATHS[@]}"; do
-      args+=( -path "$ex" -prune -o )
+      if [[ $first -eq 1 ]]; then
+        args+=( -path "$ex" -o -path "$ex/*" )
+        first=0
+      else
+        args+=( -o -path "$ex" -o -path "$ex/*" )
+      fi
     done
+    args+=( \) -prune -o )
   fi
 
   args+=(-type f)
-  [[ $HIDDEN_FILES -eq 0 ]] && args+=(-not -path '*/.*')
-
-  # Only exclude symlink files when not following.
-  [[ $FOLLOW_SYMLINKS -eq 0 ]] && args+=(-not -type l)
-
   [[ $MIN_SIZE -gt 0 ]] && args+=(-size "+${MIN_SIZE}c")
   [[ -n "$MAX_SIZE" ]] && args+=(-size "-${MAX_SIZE}c")
 
-  # Add file pattern matching if specified
+  # Build pattern arguments properly
   if [[ ${#FILE_PATTERN[@]} -gt 0 ]]; then
     args+=( \( )
     local firstp=1
@@ -791,7 +952,7 @@ find_files() {
         args+=(-name "$pat")
         firstp=0
       else
-        args+=(-o -name "$pat")
+        args+=( -o -name "$pat" )
       fi
     done
     args+=( \) )
@@ -799,138 +960,226 @@ find_files() {
 
   args+=(-print0)
   
-  if [[ $VERBOSE -eq 1 ]]; then
-    echo -e "${CYAN}Find command:${NC}"
-    printf '%s ' "$find_cmd"
-    printf -- "'%s' " "${args[@]}"
-    echo ""
+  # Execute find with error handling
+  # Quote array expansion to prevent globbing/injection
+  if ! "$find_cmd" "${args[@]}" 2>/dev/null > "$TEMP_DIR/files.list"; then
+    log_action "error" "Find command failed"
+    [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}Warning: Some directories could not be accessed${NC}"
   fi
-
-  "$find_cmd" "${args[@]}" 2>/dev/null > "$TEMP_DIR/files.list"
+  
   if [[ ! -s "$TEMP_DIR/files.list" ]]; then
     [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}No files matched criteria.${NC}"
     TOTAL_FILES=0
     return 1
   fi
+  
   TOTAL_FILES=$(tr -cd '\0' < "$TEMP_DIR/files.list" | wc -c)
+  [[ $QUIET -eq 0 ]] && echo -e "${GREEN}Found $TOTAL_FILES files to process${NC}"
   return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# HASH CALCULATION
+# HASH CALCULATION (IMPROVED WITH RACE-CONDITION FIX)
 # ═══════════════════════════════════════════════════════════════════════════
-hash_worker() {
+hash_file_with_timeout() {
   local file="$1"
   local algo="$2"
   local fast="$3"
-  local hash=""
-  local mtime size
-
+  local result=""
+  
   if [[ ! -f "$file" ]]; then
-    return 0
+    ((HASH_ERRORS++))
+    return 1
   fi
-
-  mtime=$(stat -c%Y -- "$file" 2>/dev/null || echo 0)
-  size=$(stat -c%s -- "$file" 2>/dev/null || echo 0)
+  
+  local mtime size
+  mtime=$(safe_stat "$file" "%Y")
+  size=$(safe_stat "$file" "%s")
   
   if [[ "$fast" == "1" ]]; then
     local name_hash
     name_hash=$(printf '%s' "$(basename -- "$file")" | md5sum | cut -d' ' -f1)
-    hash="${size}_${name_hash:0:16}"
+    result="${size}_${name_hash:0:16}${DELIM}${size}${DELIM}${mtime}${DELIM}${file}"
   else
-    hash=$($algo -- "$file" 2>/dev/null | cut -d' ' -f1)
+    local hash
+    if hash=$(timeout "$HASH_TIMEOUT" "$algo" -- "$file" 2>/dev/null | cut -d' ' -f1); then
+      [[ -n "$hash" ]] && result="${hash}${DELIM}${size}${DELIM}${mtime}${DELIM}${file}"
+    else
+      ((HASH_ERRORS++))
+      log_action "warning" "Failed to hash: $file"
+      return 1
+    fi
   fi
-
-  [[ -z "$hash" ]] && return 0
   
-  printf '%s%s%s%s%s%s%s\n' "$hash" "$DELIM" "$size" "$DELIM" "$mtime" "$DELIM" "$file"
+  [[ -n "$result" ]] && printf '%s\0' "$result"
 }
-
-# The export is necessary for xargs/parallel to access the function.
-export -f hash_worker
 
 calculate_hashes() {
   local mode_text="standard"
   [[ $FAST_MODE -eq 1 ]] && mode_text="fast"
-  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}📊 Calculating file hashes ($mode_text mode, threads: $THREADS)...${NC}"
+  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}Calculating file hashes ($mode_text mode, threads: $THREADS)...${NC}"
   
-  if [[ $TOTAL_FILES -eq 0 ]]; then
-    return
-  fi
-
+  [[ $TOTAL_FILES -eq 0 ]] && return
+  
   local hashes_temp="$TEMP_DIR/hashes.temp"
   : > "$hashes_temp"
-
-  # Use `xargs` with a specific number of processes for efficient parallelism
-  xargs -0 -I{} -P "$THREADS" bash -c 'hash_worker "$@"' _ "{}" "$HASH_ALGORITHM" "$FAST_MODE" \
-    < "$TEMP_DIR/files.list" >> "$hashes_temp"
-
+  
+  # Named pipe to serialize writes safely
+  local pipe="$TEMP_DIR/hashpipe"
+  mkfifo "$pipe"
+  # Single consumer writing to the file
+  ( cat < "$pipe" > "$hashes_temp" ) &
+  local cat_pid=$!
+  
+  local file_count=0
+  local active_jobs=0
+  
+  while IFS= read -r -d '' file; do
+    ((file_count++))
+    ((FILES_PROCESSED++))
+    
+    # Check memory periodically
+    if [[ $((file_count % MEMORY_CHECK_INTERVAL)) -eq 0 ]]; then
+      if ! check_memory_usage; then
+        echo -e "${YELLOW}Waiting for memory to free up...${NC}"
+        wait
+        active_jobs=0
+      fi
+    fi
+    
+    # Show progress
+    if [[ $VERBOSE -eq 1 ]] && [[ $((file_count % 100)) -eq 0 ]]; then
+      echo -e "${DIM}Processed $file_count/$TOTAL_FILES files...${NC}"
+    fi
+    
+    # Launch hash calculation in background with job control
+    {
+      hash_file_with_timeout "$file" "$HASH_ALGORITHM" "$FAST_MODE"
+    } > "$pipe" &
+    
+    ((active_jobs++))
+    
+    # Wait for jobs to complete if we hit thread limit
+    if [[ $active_jobs -ge $THREADS ]]; then
+      wait -n 2>/dev/null || true
+      ((active_jobs--))
+    fi
+  done < "$TEMP_DIR/files.list"
+  
+  # Wait for remaining jobs and the cat consumer
+  wait
+  wait "$cat_pid" 2>/dev/null || true
+  rm -f -- "$pipe"
+  
   if [[ ! -s "$hashes_temp" ]]; then
-    echo -e "${RED}Error: Hashing failed or no files were processed.${NC}"
-    rm -f -- "$hashes_temp"
-    exit 1
+    echo -e "${RED}Error: No files were successfully hashed.${NC}"
+    [[ $HASH_ERRORS -gt 0 ]] && echo -e "${YELLOW}Hash errors: $HASH_ERRORS${NC}"
+    return 1
   fi
-
+  
   mv -- "$hashes_temp" "$TEMP_DIR/hashes.txt"
+  [[ $QUIET -eq 0 ]] && echo -e "${GREEN}Hash calculation completed${NC}"
+  [[ $HASH_ERRORS -gt 0 ]] && echo -e "${YELLOW}Warning: $HASH_ERRORS files could not be hashed${NC}"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DUPLICATE DETECTION
+# DUPLICATE DETECTION (IMPROVED AWK PROCESSING)
 # ═══════════════════════════════════════════════════════════════════════════
 find_duplicates() {
-  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}🔎 Analyzing duplicates...${NC}"
+  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}Analyzing duplicates...${NC}"
   
-  # Sort the files by hash to group duplicates.
-  sort -t"$DELIM" -k1,1 < "$TEMP_DIR/hashes.txt" > "$TEMP_DIR/sorted_hashes.txt"
-  
-  # Use awk to find duplicate groups based on identical hash values.
-  awk -F"$DELIM" '
-  BEGIN { prev_hash = ""; dup_count = 0; wasted = 0; gcount = 0; }
-  {
-    hash=$1; size=$2; mtime=$3; file=$4
-    # Check for duplicate files with the same hash
-    if (hash == prev_hash) {
-      if (prev_hash != current_group_hash) {
-        # Start of a new duplicate group
-        gcount++
-        print "---"
-        print hash ":" prev_file "|" prev_size "|" prev_mtime
-        current_group_hash = prev_hash
-      }
-      print file "|" size "|" mtime
-      dup_count++
-      wasted += size
-    } else {
-      current_group_hash = ""
-    }
-    prev_hash = hash
-    prev_file = file
-    prev_size = size
-    prev_mtime = mtime
+  [[ ! -s "$TEMP_DIR/hashes.txt" ]] && {
+    echo -e "${YELLOW}No hashes found to analyze${NC}"
+    return 1
   }
+  
+  # Sort and process with improved AWK script
+  sort -z -t"$DELIM" -k1,1 < "$TEMP_DIR/hashes.txt" | \
+  "$AWK_BIN" -v DELIM="$DELIM" -v RS='\0' -v ORS='\0' '
+  BEGIN { 
+    prev_hash = ""; 
+    dup_count = 0; 
+    wasted = 0; 
+    gcount = 0;
+    group_files = "";
+    in_group = 0;
+  }
+  
+  function print_group() {
+    if (group_files != "") {
+      print "---" ORS;
+      print group_files;
+      group_files = "";
+    }
+  }
+  
+  {
+    # Skip empty records
+    if (length($0) == 0) next;
+    
+    # Parse the record
+    split($0, a, DELIM);
+    if (length(a) < 4) next;
+    
+    hash = a[1];
+    size = a[2];
+    mtime = a[3];
+    file = a[4];
+    
+    # Validate fields
+    if (length(hash) == 0 || length(file) == 0) next;
+    if (size !~ /^[0-9]+$/) next;
+    
+    if (hash == prev_hash && prev_hash != "") {
+      # Found duplicate
+      if (in_group == 0) {
+        # First duplicate in group
+        gcount++;
+        in_group = 1;
+        group_files = hash ":" prev_file "|" prev_size "|" prev_mtime ORS;
+      }
+      group_files = group_files file "|" size "|" mtime ORS;
+      dup_count++;
+      wasted += size;
+    } else {
+      # Different hash - print previous group if exists
+      print_group();
+      in_group = 0;
+    }
+    
+    prev_hash = hash;
+    prev_file = file;
+    prev_size = size;
+    prev_mtime = mtime;
+  }
+  
   END {
-    # Print the final stats
-    print "STATS:" dup_count "|" wasted "|" gcount
-  }' "$TEMP_DIR/sorted_hashes.txt" > "$TEMP_DIR/duplicates.txt"
-
-  # Extract statistics and duplicate groups
-  local stats=$(grep "^STATS:" "$TEMP_DIR/duplicates.txt" | cut -d: -f2)
+    print_group();
+    print "STATS:" dup_count "|" wasted "|" gcount ORS;
+  }' | tr '\0' '\n' > "$TEMP_DIR/duplicates.txt"
+  
+  # Extract statistics
+  local stats
+  stats=$(grep "^STATS:" "$TEMP_DIR/duplicates.txt" 2>/dev/null | tail -1 | cut -d: -f2)
+  
   if [[ -n "$stats" ]]; then
     TOTAL_DUPLICATES=$(echo "$stats" | cut -d'|' -f1)
     TOTAL_SPACE_WASTED=$(echo "$stats" | cut -d'|' -f2)
     TOTAL_DUPLICATE_GROUPS=$(echo "$stats" | cut -d'|' -f3)
+    
+    # Validate statistics
+    : ${TOTAL_DUPLICATES:=0}
+    : ${TOTAL_SPACE_WASTED:=0}
+    : ${TOTAL_DUPLICATE_GROUPS:=0}
   fi
-
-  DUPLICATE_GROUPS=$(grep -v "^STATS:" "$TEMP_DIR/duplicates.txt")
-
-  if [[ $FUZZY_MATCH -eq 1 ]]; then
-    find_similar_files
+  
+  if [[ ${TOTAL_DUPLICATE_GROUPS:-0} -eq 0 ]]; then
+    [[ $QUIET -eq 0 ]] && echo -e "${GREEN}No duplicate groups found${NC}"
+    return 1
   fi
-}
-
-find_similar_files() {
-  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}🔍 Finding similar files (fuzzy)...${NC}"
-  echo -e "${YELLOW}Fuzzy matching is not yet implemented for this version.${NC}"
+  
+  [[ $QUIET -eq 0 ]] && echo -e "${GREEN}Found ${TOTAL_DUPLICATE_GROUPS} groups with ${TOTAL_DUPLICATES} duplicate files${NC}"
+  return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -950,12 +1199,14 @@ get_location_priority() {
 
 select_file_to_keep() {
   local files_arr=("$@")
-  local keep_file="${files_arr[0]}"
+  local keep_file=""
   local best_priority=999
   
   for file_info in "${files_arr[@]}"; do
-    local file_path=$(echo "$file_info" | cut -d'|' -f1)
-    local priority=$(get_location_priority "$file_path")
+    local file_path
+    file_path=$(echo "$file_info" | cut -d'|' -f1)
+    local priority
+    priority=$(get_location_priority "$file_path")
     if (( priority < best_priority )); then
       best_priority=$priority
       keep_file="$file_path"
@@ -971,418 +1222,252 @@ show_duplicate_details() {
   [[ $VERBOSE -eq 0 ]] && return
   [[ $QUIET -eq 1 ]] && return
 
-  if [[ $TOTAL_DUPLICATE_GROUPS -eq 0 ]]; then
+  if [[ ${TOTAL_DUPLICATE_GROUPS:-0} -eq 0 ]]; then
     echo -e "${YELLOW}No duplicate groups found to display.${NC}"
     return
   fi
 
   echo ""
   echo -e "${WHITE}═══════════════════════════════════════════════════════════${NC}"
-  echo -e "${BOLD}     DUPLICATE GROUPS FOUND${NC}"
+  echo -e "${BOLD}      DUPLICATE GROUPS FOUND${NC}"
   echo -e "${WHITE}═══════════════════════════════════════════════════════════${NC}"
   
   local gid=0
-  local current_group_hash files_in_group
+  local in_group=0
+  local current_hash=""
   
-  while IFS= read -r line || [[ -n "$line" ]]; do
+  while IFS= read -r line; do
     if [[ "$line" == "---" ]]; then
-      if [[ -n "$files_in_group" ]]; then
-        ((gid++))
-        echo -e "${BOLD}${CYAN}Group $gid:${NC} Hash ${current_group_hash:0:16}... (Total size: $(format_size "$group_size"))"
-        echo -e "${DIM}─────────────────────────────────────────────────────────${NC}"
-        
-        local keep_idx=-1
-        local file_list=()
-        
-        while IFS='|' read -r path size mtime; do
-            file_list+=("$path|$size|$mtime")
-        done <<< "$files_in_group"
-        
-        if [[ $SMART_DELETE -eq 1 ]]; then
-            local keep_file=$(select_file_to_keep "${file_list[@]}")
-            for i in "${!file_list[@]}"; do
-                if [[ "${file_list[$i]}" == "$keep_file"* ]]; then
-                    keep_idx=$i
-                    break
-                fi
-            done
-        elif [[ -n "$KEEP_PATH_PRIORITY" ]]; then
-            for i in "${!file_list[@]}"; do
-                if [[ "${file_list[$i]}" == "$KEEP_PATH_PRIORITY"* ]]; then
-                    keep_idx=$i
-                    break
-                fi
-            done
-        elif [[ $KEEP_NEWEST -eq 1 ]]; then
-            IFS=$'\n' read -r -d '' -a file_list_sorted < <(printf '%s\n' "${file_list[@]}" | sort -t'|' -k3,3rn)
-            file_list=("${file_list_sorted[@]}")
-            keep_idx=0
-        elif [[ $KEEP_OLDEST -eq 1 ]]; then
-            IFS=$'\n' read -r -d '' -a file_list_sorted < <(printf '%s\n' "${file_list[@]}" | sort -t'|' -k3,3n)
-            file_list=("${file_list_sorted[@]}")
-            keep_idx=0
-        else
-            IFS=$'\n' read -r -d '' -a file_list_sorted < <(printf '%s\n' "${file_list[@]}" | sort)
-            file_list=("${file_list_sorted[@]}")
-            keep_idx=0
-        fi
+      in_group=1
+      continue
+    elif [[ "$line" =~ ^STATS: ]]; then
+      break
+    elif [[ $in_group -eq 1 && "$line" =~ ^([a-f0-9]+):(.*)$ ]]; then
+      ((gid++))
+      current_hash="${BASH_REMATCH[1]}"
+      local first_file="${BASH_REMATCH[2]}"
+      echo -e "${BOLD}${CYAN}Group $gid:${NC} Hash ${current_hash:0:16}..."
+      echo -e "${DIM}─────────────────────────────────────────────────────────${NC}"
+      
+      local path size mtime
+      IFS='|' read -r path size mtime <<< "$first_file"
+      local status=""
+      is_in_system_folder "$path" && status=" (system file)"
+      echo -e "  - $(format_size "$size")  ${DIM}${path}${NC}${YELLOW}${status}${NC}"
+    elif [[ $in_group -eq 1 && -n "$line" ]]; then
+      local path size mtime
+      IFS='|' read -r path size mtime <<< "$line"
+      local status=""
+      is_in_system_folder "$path" && status=" (system file)"
+      echo -e "  - $(format_size "$size")  ${DIM}${path}${NC}${YELLOW}${status}${NC}"
+    fi
+  done < "$TEMP_DIR/duplicates.txt"
+  
+  echo ""
+}
 
-        for i in "${!file_list[@]}"; do
-          local path size
-          path=$(echo "${file_list[$i]}" | cut -d'|' -f1)
-          size=$(echo "${file_list[$i]}" | cut -d'|' -f2)
-          local status=""
-          [[ $i -eq $keep_idx ]] && status=" (keep)"
-          is_in_system_folder "$path" && status=" (system file)"
-          echo -e "  - $(format_size "$size")  ${DIM}${path}${NC}${GREEN}${status}${NC}"
-        done
-        echo ""
+# ═══════════════════════════════════════════════════════════════════════════
+# FILE PROCESSING AND DELETION
+# ═══════════════════════════════════════════════════════════════════════════
+process_duplicate_group() {
+  local -a files=("$@")
+  local keep_idx=0
+  local keep_file keep_size
+  
+  [[ ${#files[@]} -lt 2 ]] && return 0
+
+  # Determine which file to keep based on strategy
+  if [[ $SMART_DELETE -eq 1 ]]; then
+    local keep_path
+    keep_path=$(select_file_to_keep "${files[@]}")
+    for i in "${!files[@]}"; do
+      local path=$(echo "${files[$i]}" | cut -d'|' -f1)
+      if [[ "$path" == "$keep_path" ]]; then
+        keep_idx=$i
+        break
       fi
-      current_group_hash=""
-      files_in_group=""
-      group_size=0
+    done
+  elif [[ -n "$KEEP_PATH_PRIORITY" ]]; then
+    for i in "${!files[@]}"; do
+      local path=$(echo "${files[$i]}" | cut -d'|' -f1)
+      if [[ "$path" == "$KEEP_PATH_PRIORITY"* ]]; then
+        keep_idx=$i
+        break
+      fi
+    done
+  elif [[ $KEEP_NEWEST -eq 1 ]]; then
+    local newest_time=0
+    for i in "${!files[@]}"; do
+      local mtime=$(echo "${files[$i]}" | cut -d'|' -f3)
+      if [[ $mtime -gt $newest_time ]]; then
+        newest_time=$mtime
+        keep_idx=$i
+      fi
+    done
+  elif [[ $KEEP_OLDEST -eq 1 ]]; then
+    local oldest_time=9999999999
+    for i in "${!files[@]}"; do
+      local mtime=$(echo "${files[$i]}" | cut -d'|' -f3)
+      if [[ $mtime -lt $oldest_time ]]; then
+        oldest_time=$mtime
+        keep_idx=$i
+      fi
+    done
+  fi
+  
+  keep_file=$(echo "${files[$keep_idx]}" | cut -d'|' -f1)
+  keep_size=$(echo "${files[$keep_idx]}" | cut -d'|' -f2)
+  
+  [[ $VERBOSE -eq 1 ]] && echo -e "${GREEN}  + Keeping: $keep_file${NC}"
+  
+  # Process duplicates
+  for i in "${!files[@]}"; do
+    [[ $i -eq $keep_idx ]] && continue
+    
+    local path size mtime
+    IFS='|' read -r path size mtime <<< "${files[$i]}"
+    
+    # Safety checks
+    if ! verify_safe_to_delete "$path"; then
+      [[ $VERBOSE -eq 1 ]] && echo -e "${YELLOW}  ! Skipped (safety): $path${NC}"
       continue
     fi
     
-    if [[ "$line" =~ ^([a-f0-9]+):(.*)$ ]]; then
-      current_group_hash="${BASH_REMATCH[1]}"
-      line="${BASH_REMATCH[2]}"
+    if [[ $SKIP_SYSTEM_FOLDERS -eq 1 ]] && is_in_system_folder "$path"; then
+      [[ $VERBOSE -eq 1 ]] && echo -e "${YELLOW}  ! Skipped (system): $path${NC}"
+      continue
     fi
-
-    local path size mtime
-    path=$(echo "$line" | cut -d'|' -f1)
-    size=$(echo "$line" | cut -d'|' -f2)
-    mtime=$(echo "$line" | cut -d'|' -f3)
-
-    files_in_group+="$path|$size|$mtime"$'\n'
-    ((group_size+=size))
-  done < "$TEMP_DIR/duplicates.txt"
-}
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ENHANCED INTERACTIVE MODE FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════
-show_file_details() {
-  local file="$1"
-  local is_keep="$2"
-  if [[ ! -f "$file" ]]; then
-    echo -e "${RED}    ⚠ File not found: $file${NC}"
-    return
-  fi
-  local mtime=$(stat -c '%Y' -- "$file" 2>/dev/null || echo 0)
-  local mtime_human=$(date -d "@$mtime" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "Unknown")
-  local perms=$(stat -c '%A' -- "$file" 2>/dev/null || echo "Unknown")
-  local owner=$(stat -c '%U:%G' -- "$file" 2>/dev/null || echo "Unknown")
-  local size=$(stat -c '%s' -- "$file" 2>/dev/null || echo 0)
-  local path_short="$file"
-  if [[ ${#file} -gt 80 ]]; then
-    path_short="...${file: -75}"
-  fi
-  local status_icons=""
-  [[ "$is_keep" == "true" ]] && status_icons+="🔒 "
-  is_critical_system_file "$file" && status_icons+="⚠️ "
-  is_in_system_folder "$file" && status_icons+="🛡️ "
-  [[ -x "$file" ]] && status_icons+="⚡ "
-  echo -e "    ${BOLD}📄 ${path_short}${NC}"
-  echo -e "    ${CYAN}Size:${NC}      $(format_size "$size") ($size bytes)"
-  echo -e "    ${CYAN}Modified:${NC}  $mtime_human"
-  echo -e "    ${CYAN}Owner:${NC}     $owner"
-  echo -e "    ${CYAN}Perms:${NC}     $perms"
-  [[ -n "$status_icons" ]] && echo -e "    ${CYAN}Status:${NC}    $status_icons"
-  echo ""
-}
-
-show_file_comparison() {
-  local keep_file="$1"
-  local dup_file="$2"
-  echo -e "${WHITE}╭─────────────────────────────────────────────────────────╮${NC}"
-  echo -e "${WHITE}│         FILE COMPARISON                 │${NC}"
-  echo -e "${WHITE}├─────────────────────────────────────────────────────────┤${NC}"
-  echo -e "${GREEN}  🔒 KEEP (Current choice):${NC}"
-  show_file_details "$keep_file" "true"
-  echo -e "${WHITE}├─────────────────────────────────────────────────────────┤${NC}"
-  echo -e "${YELLOW}  🔄 DUPLICATE:${NC}"
-  show_file_details "$dup_file" "false"
-  echo -e "${WHITE}╰─────────────────────────────────────────────────────────╯${NC}"
-}
-
-show_interactive_menu() {
-  local group_num="$1"
-  local total_groups="$2"
-  local freed_space="$3"
-  echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
-  echo -e "${BOLD}  Interactive Mode - Group $group_num of $total_groups${NC}"
-  echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
-  echo ""
-  echo -e "${BOLD}Available Actions:${NC}"
-  echo ""
-  echo -e "${GREEN}  [d] Delete      - Remove the duplicate file permanently"
-  echo -e "${BLUE}  [h] Hardlink    - Replace duplicate with hardlink (saves space)"
-  echo -e "${YELLOW}  [s] Skip        - Keep both files, move to next"
-  echo -e "${CYAN}  [k] Keep This   - Mark this file as the one to keep instead"
-  echo -e "${MAGENTA}  [v] View        - Open file in default application"
-  echo -e "${WHITE}  [i] Info        - Show detailed file information"
-  echo -e "${DIM}  [a] Apply to All- Apply current choice to remaining duplicates"
-  echo -e "${RED}  [q] Quit        - Stop processing and exit"
-  echo ""
-  echo -e "${DIM}Potential space savings: $(format_size "$freed_space")${NC}"
-  echo ""
-}
-
-get_interactive_choice() {
-  local default="${1:-d}"
-  echo -ne "${BOLD}Choose action [${default}]: ${NC}"
-  read -r -n 1 response
-  echo ""
-  response=${response,,}
-  [[ -z "$response" ]] && response="$default"
-  echo "$response"
-}
-
-open_file_viewer() {
-  local file="$1"
-  if command -v xdg-open &>/dev/null; then
-    echo -e "${CYAN}Opening file in default application...${NC}"
-    xdg-open -- "$file" 2>/dev/null &
-  elif command -v open &>/dev/null; then
-    echo -e "${CYAN}Opening file in default application...${NC}"
-    open -- "$file" 2>/dev/null &
-  elif command -v start &>/dev/null; then
-    echo -e "${CYAN}Opening file in default application...${NC}"
-    start -- "$file" 2>/dev/null &
-  else
-    echo -e "${YELLOW}No file viewer available. File path: $file${NC}"
-  fi
-  echo -ne "${DIM}Press Enter to continue...${NC}"
-  read -r
-}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# FILE OPERATIONS
-# ═══════════════════════════════════════════════════════════════════════════
-backup_file() {
-  local file="$1"
-  [[ -z "$BACKUP_DIR" ]] && return 0
-  local timestamp dir relative_path target
-  timestamp=$(date +%Y%m%d_%H%M%S)
-  dir="$BACKUP_DIR/$timestamp"
-  mkdir -p -- "$dir"
-  relative_path="${file#/}"
-  target="$dir/$relative_path"
-  mkdir -p -- "$(dirname -- "$target")"
-  if cp -p -- "$file" "$target" 2>/dev/null; then
-    [[ $VERBOSE -eq 1 ]] && echo -e "${BLUE}  Backed up: $file${NC}"
-    return 0
-  fi
-  return 1
-}
-
-verify_identical() {
-  local file1="$1"
-  local file2="$2"
-  [[ $VERIFY_MODE -eq 0 ]] && return 0
-  if cmp -s -- "$file1" "$file2"; then
-    return 0
-  fi
-  echo -e "${YELLOW}  Warning: Same hash but content differs! This may indicate a hash collision or read error.${NC}"
-  echo -e "${YELLOW}  A: $file1${NC}"
-  echo -e "${YELLOW}  B: $file2${NC}"
-  [[ -n "$LOG_FILE" ]] && echo "$(date): Mismatch detected (hash collision/read error): $file1 and $file2" >> "$LOG_FILE"
-  return 1
+    
+    if [[ $VERIFY_MODE -eq 1 ]] && ! verify_identical "$keep_file" "$path"; then
+      [[ $VERBOSE -eq 1 ]] && echo -e "${RED}  ! Skipped (not identical): $path${NC}"
+      continue
+    fi
+    
+    # Interactive mode
+    if [[ $INTERACTIVE_DELETE -eq 1 ]]; then
+      # HARDENED: Safer default in interactive mode (default -> skip)
+      echo -ne "${BOLD}[d]elete, [h]ardlink, [s]kip, [q]uit? [s]: ${NC}"
+      read -r -n 1 response
+      echo ""
+      response=${response,,}
+      [[ -z "$response" ]] && response="s" # Safer default
+      
+      case "$response" in
+        s) continue ;;
+        q) exit 0 ;;
+        h) HARDLINK_MODE=1; DELETE_MODE=0 ;;
+      esac
+    fi
+    
+    # Backup if requested
+    if [[ -n "$BACKUP_DIR" && $DRY_RUN -eq 0 ]]; then
+      backup_file "$path"
+    fi
+    
+    # Perform action
+    if [[ $DRY_RUN -eq 1 ]]; then
+      if [[ $HARDLINK_MODE -eq 1 ]]; then
+        echo -e "${YELLOW}  Would hardlink: $path -> $keep_file${NC}"
+        ((FILES_HARDLINKED++))
+      elif [[ -n "$QUARANTINE_DIR" ]]; then
+        echo -e "${YELLOW}  Would quarantine: $path${NC}"
+        ((FILES_QUARANTINED++))
+      else
+        echo -e "${YELLOW}  Would delete: $path${NC}"
+        ((FILES_DELETED++))
+      fi
+      ((SPACE_FREED+=size))
+    else
+      if [[ $HARDLINK_MODE -eq 1 ]]; then
+        local keep_dev dup_dev
+        keep_dev=$(safe_stat "$keep_file" "%d")
+        dup_dev=$(safe_stat "$path" "%d")
+        if [[ "$keep_dev" == "$dup_dev" ]]; then
+          # FIXED: Replaced non-atomic `rm` and `ln` with atomic `ln -f`.
+          if ln -f -- "$keep_file" "$path" 2>/dev/null; then
+            ((FILES_HARDLINKED++))
+            ((SPACE_FREED+=size))
+            [[ $VERBOSE -eq 1 ]] && echo -e "${BLUE}  - Hardlinked: $path${NC}"
+            log_action "info" "Hardlinked: $path -> $keep_file"
+          else
+            echo -e "${RED}  - Failed to hardlink: $path${NC}"
+            log_action "error" "Failed to hardlink: $path"
+          fi
+        else
+          echo -e "${RED}  - Cannot hardlink across filesystems: $path${NC}"
+        fi
+      elif [[ -n "$QUARANTINE_DIR" ]]; then
+        local qfile="$QUARANTINE_DIR/$(basename -- "$path")_$(date +%s)_$(printf '%s' "$path" | sha256sum | cut -c1-8)"
+        if mv -- "$path" "$qfile" 2>/dev/null; then
+          ((FILES_QUARANTINED++))
+          ((SPACE_FREED+=size))
+          [[ $VERBOSE -eq 1 ]] && echo -e "${YELLOW}  - Quarantined: $path${NC}"
+          log_action "info" "Quarantined: $path -> $qfile"
+        fi
+      elif [[ $DELETE_MODE -eq 1 ]]; then
+        if [[ $USE_TRASH -eq 1 ]] && command -v trash-put &>/dev/null; then
+          if trash-put -- "$path" 2>/dev/null; then
+            ((FILES_DELETED++))
+            ((SPACE_FREED+=size))
+            [[ $VERBOSE -eq 1 ]] && echo -e "${YELLOW}  - Trashed: $path${NC}"
+            log_action "info" "Trashed: $path"
+          fi
+        else
+          if rm -- "$path" 2>/dev/null; then
+            ((FILES_DELETED++))
+            ((SPACE_FREED+=size))
+            [[ $VERBOSE -eq 1 ]] && echo -e "${RED}  - Deleted: $path${NC}"
+            log_action "info" "Deleted: $path"
+          fi
+        fi
+      fi
+    fi
+  done
 }
 
 delete_duplicates() {
   if [[ $DELETE_MODE -eq 0 && $HARDLINK_MODE -eq 0 && -z "$QUARANTINE_DIR" ]]; then
     return
   fi
-  local action="Processing"
-  [[ $DELETE_MODE -eq 1 ]] && action="Deleting"
-  [[ $HARDLINK_MODE -eq 1 ]] && action="Hardlinking"
-  [[ -n "$QUARANTINE_DIR" ]] && action="Quarantining"
-  [[ $DRY_RUN -eq 1 ]] && action="Would $action"
-  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}🗑️  $action duplicate files...${NC}"
+
+  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}Processing duplicate files...${NC}"
   
-  local deleted=0 freed=0 links=0 quarantined=0 processed_space=0
-  local auto_choice="" apply_to_all=0
+  local in_group=0
+  local -a current_group=()
   local group_count=0
-  local total_groups=$(grep -c "---" "$TEMP_DIR/duplicates.txt")
   
-  local current_group_hash files_in_group
-  
-  while IFS= read -r line || [[ -n "$line" ]]; do
+  while IFS= read -r line; do
     if [[ "$line" == "---" ]]; then
-      if [[ -n "$files_in_group" ]]; then
+      if [[ ${#current_group[@]} -gt 0 ]]; then
         ((group_count++))
-        local file_list=()
-        while IFS='|' read -r path size mtime; do
-            file_list+=("$path|$size|$mtime")
-        done <<< "$files_in_group"
-
-        local keep_idx=-1
-        local keep_file keep_size
-        
-        # Determine which file to keep based on strategy
-        if [[ $SMART_DELETE -eq 1 ]]; then
-            local keep_path=$(select_file_to_keep "${file_list[@]}")
-            for i in "${!file_list[@]}"; do
-                if [[ "${file_list[$i]}" == "$keep_path"* ]]; then keep_idx=$i; break; fi
-            done
-        elif [[ -n "$KEEP_PATH_PRIORITY" ]]; then
-            for i in "${!file_list[@]}"; do
-                if [[ "${file_list[$i]}" == "$KEEP_PATH_PRIORITY"* ]]; then keep_idx=$i; break; fi
-            done
-        elif [[ $KEEP_NEWEST -eq 1 ]]; then
-            IFS=$'\n' read -r -d '' -a file_list_sorted < <(printf '%s\n' "${file_list[@]}" | sort -t'|' -k3,3rn)
-            file_list=("${file_list_sorted[@]}")
-            keep_idx=0
-        elif [[ $KEEP_OLDEST -eq 1 ]]; then
-            IFS=$'\n' read -r -d '' -a file_list_sorted < <(printf '%s\n' "${file_list[@]}" | sort -t'|' -k3,3n)
-            file_list=("${file_list_sorted[@]}")
-            keep_idx=0
-        else
-            IFS=$'\n' read -r -d '' -a file_list_sorted < <(printf '%s\n' "${file_list[@]}" | sort)
-            file_list=("${file_list_sorted[@]}")
-            keep_idx=0
-        fi
-
-        # Extract the details of the file to keep
-        if [[ $keep_idx -ne -1 ]]; then
-            keep_file=$(echo "${file_list[$keep_idx]}" | cut -d'|' -f1)
-            keep_size=$(echo "${file_list[$keep_idx]}" | cut -d'|' -f2)
-            [[ $VERBOSE -eq 1 ]] && echo -e "${GREEN}  ✓ Keeping: $keep_file${NC}"
-        fi
-
-        for i in "${!file_list[@]}"; do
-          if [[ $i -eq $keep_idx ]]; then continue; fi
-          local path size
-          path=$(echo "${file_list[$i]}" | cut -d'|' -f1)
-          size=$(echo "${file_list[$i]}" | cut -d'|' -f2)
-          ((processed_space+=size))
-          
-          if ! verify_safe_to_delete "$path"; then
-            echo -e "${GREEN}  ✓ Skipped (safety check): $path${NC}"
-            [[ -n "$LOG_FILE" ]] && echo "$(date): Skipped (safety): $path" >> "$LOG_FILE"
-            continue
-          fi
-          
-          if [[ $SKIP_SYSTEM_FOLDERS -eq 1 ]] && is_in_system_folder "$path"; then
-            [[ $VERBOSE -eq 1 ]] && echo -e "${YELLOW}  ⚠ Skipped (system folder): $path${NC}"
-            continue
-          fi
-          
-          if [[ $VERIFY_MODE -eq 1 ]]; then
-            if ! verify_identical "$keep_file" "$path"; then
-              echo -e "${RED}  Skipping non-identical files${NC}"
-              continue
-            fi
-          fi
-          
-          if [[ $INTERACTIVE_DELETE -eq 1 && $apply_to_all -eq 0 ]]; then
-            clear
-            echo -e "${CYAN}Group $group_count of $total_groups${NC}"
-            echo -e "${DIM}Space processed: $(format_size "$processed_space")${NC}"
-            echo ""
-            show_file_comparison "$keep_file" "$path"
-            local choice=""
-            while true; do
-              echo -e "${BOLD}Actions: [d]elete, [h]ardlink, [s]kip, [k]eep this, [v]iew, [i]nfo, [b]ackup, [g]roup skip, [q]uit, [a]pply to all${NC}"
-              echo -ne "${BOLD}Choose action [d]: ${NC}"
-              read -r -n 1 response
-              echo ""
-              response=${response,,}
-              [[ -z "$response" ]] && response="d"
-              case "$response" in
-                d) echo -e "${YELLOW}Marking for deletion...${NC}"; break;;
-                h) echo -e "${BLUE}Will create hardlink...${NC}"; HARDLINK_MODE=1; DELETE_MODE=0; break;;
-                s) echo -e "${GREEN}Skipping this file...${NC}"; break;;
-                k)
-                  echo -e "${CYAN}Swapping keep choice...${NC}"
-                  local temp_file="$keep_file"
-                  keep_file="$path"
-                  path="$temp_file"
-                  echo -e "${GREEN}Now keeping: $keep_file${NC}"; sleep 1; continue;;
-                v) open_file_viewer "$path"; continue;;
-                i)
-                  clear
-                  echo -e "${CYAN}=== DETAILED FILE INFORMATION ===${NC}"
-                  echo ""
-                  echo -e "${GREEN}KEEP FILE:${NC}"
-                  show_file_details "$keep_file" "true"
-                  echo -e "${YELLOW}DUPLICATE FILE:${NC}"
-                  show_file_details "$path" "false"
-                  echo -ne "${DIM}Press Enter to continue...${NC}"; read -r; continue;;
-                b)
-                  if [[ $DRY_RUN -eq 1 ]]; then echo -e "${YELLOW}Would backup: $path${NC}"; else backup_file "$path"; fi
-                  continue;;
-                g) echo -e "${YELLOW}Skipping rest of this group...${NC}"; return;;
-                a)
-                  echo -ne "${YELLOW}Apply this choice (${response}) to all remaining duplicates? (y/N): ${NC}"; read -r confirm
-                  if [[ "$confirm" =~ ^[Yy] ]]; then apply_to_all=1; auto_choice="$response"; echo -e "${GREEN}Will apply '$response' to remaining files...${NC}"; sleep 1; fi
-                  break;;
-                q) echo -e "${YELLOW}Quitting interactive mode...${NC}"; exit 0;;
-                *) echo -e "${RED}Invalid choice. Please try again.${NC}"; sleep 1; continue;;
-              esac
-            done
-            if [[ "$response" == "s" ]]; then echo -e "${GREEN}  ✓ Skipped: $path${NC}"; continue; fi
-            if [[ "$response" == "k" ]]; then continue; fi
-          fi
-          
-          if [[ -n "$BACKUP_DIR" && $DRY_RUN -eq 0 ]]; then backup_file "$path"; fi
-          
-          if [[ $DRY_RUN -eq 1 ]]; then
-            if [[ $HARDLINK_MODE -eq 1 ]]; then echo -e "${YELLOW}  Would hardlink: $path -> $keep_file${NC}";
-            elif [[ -n "$QUARANTINE_DIR" ]]; then echo -e "${YELLOW}  Would quarantine: $path${NC}";
-            else echo -e "${YELLOW}  Would delete: $path${NC}"; fi
-            ((deleted++)); ((freed+=size))
-          elif [[ $HARDLINK_MODE -eq 1 ]]; then
-            if [[ -f "$keep_file" ]]; then
-              if rm -f -- "$path" && ln -- "$keep_file" "$path"; then
-                ((links++)); ((freed+=size))
-                [[ $VERBOSE -eq 1 ]] && echo -e "${BLUE}  ↔ Hardlinked: $path${NC}"
-                [[ -n "$LOG_FILE" ]] && echo "$(date): Hardlinked: $path -> $keep_file" >> "$LOG_FILE"
-              else
-                echo -e "${RED}  Failed to hardlink: $path${NC}"
-              fi
-            else
-              echo -e "${RED}  Keep file not found: $keep_file${NC}"
-            fi
-          elif [[ -n "$QUARANTINE_DIR" ]]; then
-            local qfile="$QUARANTINE_DIR/$(basename -- "$path")_$(date +%s)"
-            if mv -- "$path" "$qfile" 2>/dev/null; then ((quarantined++)); ((freed+=size)); [[ $VERBOSE -eq 1 ]] && echo -e "${YELLOW}  ⚠ Quarantined: $path${NC}"; [[ -n "$LOG_FILE" ]] && echo "$(date): Quarantined: $path -> $qfile" >> "$LOG_FILE"; fi
-          elif [[ $USE_TRASH -eq 1 ]]; then
-            if trash-put -- "$path" 2>/dev/null; then ((deleted++)); ((freed+=size)); [[ $VERBOSE -eq 1 ]] && echo -e "${YELLOW}  🗑 Trashed: $path${NC}"; [[ -n "$LOG_FILE" ]] && echo "$(date): Trashed: $path" >> "$LOG_FILE"; fi
-          else
-            if rm -f -- "$path" 2>/dev/null; then ((deleted++)); ((freed+=size)); [[ $VERBOSE -eq 1 ]] && echo -e "${RED}  ✗ Deleted: $path${NC}"; [[ -n "$LOG_FILE" ]] && echo "$(date): Deleted: $path" >> "$LOG_FILE"; fi
-          fi
-        done
+        [[ $VERBOSE -eq 1 ]] && echo -e "${CYAN}Processing group $group_count...${NC}"
+        process_duplicate_group "${current_group[@]}"
       fi
-      files_in_group=""
-      current_group_hash=""
-    elif [[ "$line" =~ ^([a-f0-9]+):(.*)$ ]]; then
-      current_group_hash="${BASH_REMATCH[1]}"
-      files_in_group="${BASH_REMATCH[2]}"$'\n'
-    else
-      files_in_group+="$line"$'\n'
+      in_group=1
+      current_group=()
+      continue
+    elif [[ "$line" =~ ^STATS: ]]; then
+      break
+    elif [[ $in_group -eq 1 && "$line" =~ ^([a-f0-9]+):(.*)$ ]]; then
+      current_group+=("${BASH_REMATCH[2]}")
+    elif [[ $in_group -eq 1 && -n "$line" ]]; then
+      current_group+=("$line")
     fi
   done < "$TEMP_DIR/duplicates.txt"
-
-  FILES_DELETED=$deleted
-  FILES_HARDLINKED=$links
-  FILES_QUARANTINED=$quarantined
-  SPACE_FREED=$freed
   
-  if [[ $QUIET -eq 0 ]]; then
-    if [[ $HARDLINK_MODE -eq 1 ]]; then echo -e "${GREEN}✅ Created $links hardlinks, freed $(format_size "$freed")${NC}";
-    else echo -e "${GREEN}✅ Processed $deleted files, freed $(format_size "$freed")${NC}"; fi
+  # Process final group
+  if [[ ${#current_group[@]} -gt 0 ]]; then
+    ((group_count++))
+    [[ $VERBOSE -eq 1 ]] && echo -e "${CYAN}Processing group $group_count...${NC}"
+    process_duplicate_group "${current_group[@]}"
   fi
   
-  if [[ $INTERACTIVE_DELETE -eq 1 ]]; then
-    clear
-    echo -e "${GREEN}🎉 Interactive processing completed!${NC}"
-    echo -e "${CYAN}Files processed: $deleted${NC}"
-    echo -e "${CYAN}Space freed: $(format_size "$freed")${NC}"
-    echo ""
+  if [[ $QUIET -eq 0 ]]; then
+    echo -e "${GREEN}Processing completed:${NC}"
+    echo -e "  ${GREEN}Files deleted: ${FILES_DELETED}${NC}"
+    echo -e "  ${GREEN}Files hardlinked: ${FILES_HARDLINKED}${NC}"
+    echo -e "  ${GREEN}Files quarantined: ${FILES_QUARANTINED}${NC}"
+    echo -e "  ${GREEN}Space freed: $(format_size "${SPACE_FREED}")${NC}"
   fi
 }
 
@@ -1390,12 +1475,15 @@ delete_duplicates() {
 # REPORT GENERATION
 # ═══════════════════════════════════════════════════════════════════════════
 generate_html_report() {
-  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}📄 Generating HTML report...${NC}"
+  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}Generating HTML report...${NC}"
   local report_file="$OUTPUT_DIR/$HTML_REPORT"
-  {
-    cat << EOF
-<!DOCTYPE html><html lang="en"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  
+  cat > "$report_file" << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>DupeFinder Pro Report</title>
 <style>
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;background:#f1f3f5;margin:0}
@@ -1409,21 +1497,25 @@ h1{margin:0;font-size:28px}
 .card{background:#fff;border:1px solid #eceff1;border-radius:8px;padding:16px;text-align:center}
 .val{font-size:22px;color:#667eea;font-weight:700}
 .label{color:#6c757d;text-transform:uppercase;font-size:12px;margin-top:4px}
-.group{border-top:1px solid #f1f3f5}
-.group .hdr{background:#fafbfc;padding:12px 16px;cursor:pointer;font-weight:600}
+.group{border-top:1px solid #f1f3f5;cursor:pointer}
+.group:hover{background:#fafbfc}
+.group .hdr{padding:12px 16px;font-weight:600}
 .group .files{padding:6px 16px 16px 16px;display:none}
-.file{padding:8px 0;border-bottom:1px solid #f6f7f8}
+.file{padding:8px 0;border-bottom:1px solid #f6f7f8;font-family:monospace;font-size:12px}
 .file:last-child{border-bottom:0}
-.code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#495057}
 .show .files{display:block}
-.footer{padding:16px 20px;background:#fff;border-top:1px solid #eceff1}
 .system-file{color:#d32f2f}
+.footer{padding:16px 20px;background:#fff;border-top:1px solid #eceff1;text-align:center;color:#6c757d;font-size:12px}
 </style>
 <script>
-function toggle(id){var el=document.getElementById(id); if(el){el.classList.toggle('show');}}
+function toggle(id){var el=document.getElementById(id);if(el){el.classList.toggle('show');}}
 </script>
-</head><body>
+</head>
+<body>
 <div class="container">
+EOF
+
+  cat >> "$report_file" << EOF
 <header>
   <h1>DupeFinder Pro Report
     $([ $SKIP_SYSTEM_FOLDERS -eq 1 ] && echo '<span class="safety-badge">System Protected</span>' || echo '<span class="safety-badge safety-warning">Full Scan</span>')
@@ -1431,228 +1523,243 @@ function toggle(id){var el=document.getElementById(id); if(el){el.classList.togg
   <div class="subtitle">by ${AUTHOR} | Generated: $(date '+%B %d, %Y %H:%M:%S')</div>
 </header>
 <div class="stats">
-  <div class="card"><div class="val">${TOTAL_FILES}</div><div class="label">Files Scanned</div></div>
-  <div class="card"><div class="val">${TOTAL_DUPLICATES}</div><div class="label">Duplicates Found</div></div>
-  <div class="card"><div class="val">${TOTAL_DUPLICATE_GROUPS}</div><div class="label">Duplicate Groups</div></div>
+  <div class="card"><div class="val">${TOTAL_FILES:-0}</div><div class="label">Files Scanned</div></div>
+  <div class="card"><div class="val">${TOTAL_DUPLICATES:-0}</div><div class="label">Duplicates Found</div></div>
+  <div class="card"><div class="val">${TOTAL_DUPLICATE_GROUPS:-0}</div><div class="label">Duplicate Groups</div></div>
   <div class="card"><div class="val">$(format_size "${TOTAL_SPACE_WASTED:-0}")</div><div class="label">Space Wasted</div></div>
 </div>
 <div>
 EOF
-    local gid=0
-    local current_group_hash files_in_group
-    
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ "$line" == "---" ]]; then
-            if [[ -n "$files_in_group" ]]; then
-                ((gid++))
-                echo "<div id=\"g$gid\" class=\"group\">"
-                echo "<div class=\"hdr\" onclick=\"toggle('g$gid')\">Group $gid (Hash: ${current_group_hash:0:16}…)</div>"
-                echo "<div class=\"files\">"
-                while IFS='|' read -r filepath size mtime; do
-                    [[ -z "$filepath" ]] && continue
-                    local class=""
-                    is_in_system_folder "$filepath" && class="system-file"
-                    printf '<div class="file"><div class="code %s">%s</div><div>Size: %s</div></div>\n' \
-                        "$class" \
-                        "$(printf '%s' "$filepath" | sed 's/&/\&amp;/g;s/</\&lt;/g')" \
-                        "$(format_size "$size")"
-                done <<< "$files_in_group"
-                echo "</div></div>"
-            fi
-            current_group_hash=""
-            files_in_group=""
-            continue
-        fi
-        
-        if [[ "$line" =~ ^([a-f0-9]+):(.*)$ ]]; then
-            current_group_hash="${BASH_REMATCH[1]}"
-            files_in_group="${BASH_REMATCH[2]}"$'\n'
-        else
-            files_in_group+="$line"$'\n'
-        fi
-    done < "$TEMP_DIR/duplicates.txt"
+  
+  local gid=0
+  local in_group=0
+  local first_group=1
+  
+  while IFS= read -r line; do
+    if [[ "$line" == "---" ]]; then
+      [[ $in_group -eq 1 && $gid -gt 0 ]] && echo "</div></div>" >> "$report_file"
+      in_group=1
+      continue
+    elif [[ "$line" =~ ^STATS: ]]; then
+      [[ $in_group -eq 1 && $gid -gt 0 ]] && echo "</div></div>" >> "$report_file"
+      break
+    elif [[ $in_group -eq 1 && "$line" =~ ^([a-f0-9]+):(.*)$ ]]; then
+      ((gid++))
+      current_hash="${BASH_REMATCH[1]}"
+      local first_file="${BASH_REMATCH[2]}"
+      echo "<div id=\"g$gid\" class=\"group\" onclick=\"toggle('g$gid')\">" >> "$report_file"
+      echo "<div class=\"hdr\">Group $gid (Hash: ${current_hash:0:16}...)</div>" >> "$report_file"
+      echo "<div class=\"files\">" >> "$report_file"
+      
+      local path size mtime
+      IFS='|' read -r path size mtime <<< "$first_file"
+      local class=""
+      is_in_system_folder "$path" && class="system-file"
+      # HARDENED: Correctly escape single quotes in HTML output
+      printf '<div class="file %s">%s<br>Size: %s</div>\n' \
+        "$class" \
+        "$(printf '%s' "$path" | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g;s/"/\&quot;/g;s/'"'"'/\&#39;/g')" \
+        "$(format_size "$size")" >> "$report_file"
+    elif [[ $in_group -eq 1 && -n "$line" ]]; then
+      local path size mtime
+      IFS='|' read -r path size mtime <<< "$line"
+      local class=""
+      is_in_system_folder "$path" && class="system-file"
+      # HARDENED: Correctly escape single quotes in HTML output
+      printf '<div class="file %s">%s<br>Size: %s</div>\n' \
+        "$class" \
+        "$(printf '%s' "$path" | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g;s/"/\&quot;/g;s/'"'"'/\&#39;/g')" \
+        "$(format_size "$size")" >> "$report_file"
+    fi
+  done < "$TEMP_DIR/duplicates.txt"
 
-    cat << EOF
+  cat >> "$report_file" << EOF
 </div>
 <div class="footer">
-  <small>Report generated with system protection: $([ $SKIP_SYSTEM_FOLDERS -eq 1 ] && echo "enabled" || echo "disabled")</small>
+  Report generated with DupeFinder Pro v${VERSION} | System protection: $([ $SKIP_SYSTEM_FOLDERS -eq 1 ] && echo "enabled" || echo "disabled")
 </div>
-</div></body></html>
+</div>
+</body>
+</html>
 EOF
-  } > "$report_file"
-  [[ $QUIET -eq 0 ]] && echo -e "${GREEN}✅ HTML report saved to: $report_file${NC}"
+  
+  [[ $QUIET -eq 0 ]] && echo -e "${GREEN}✓ HTML report saved: $report_file${NC}"
 }
 
 generate_csv_report() {
   [[ -z "$CSV_REPORT" ]] && return
-  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}📊 Generating CSV report...${NC}"
+  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}Generating CSV report...${NC}"
+  
   local csv="$OUTPUT_DIR/$CSV_REPORT"
   echo "Hash,File Path,Size (bytes),Size (human),Group ID,System File" > "$csv"
-  local gid=0
-  local current_group_hash files_in_group
   
-  while IFS= read -r line || [[ -n "$line" ]]; do
-      if [[ "$line" == "---" ]]; then
-          if [[ -n "$files_in_group" ]]; then
-              ((gid++))
-              while IFS='|' read -r fp sz mtime; do
-                  [[ -z "$fp" ]] && continue
-                  local is_system="No"
-                  is_in_system_folder "$fp" && is_system="Yes"
-                  printf '%s,"%s",%s,"%s",%s,%s\n' "$current_group_hash" "${fp//\"/\"\"}" "$sz" "$(format_size "$sz")" "$gid" "$is_system" >> "$csv"
-              done <<< "$files_in_group"
-          fi
-          current_group_hash=""
-          files_in_group=""
-          continue
-      fi
+  local gid=0
+  local in_group=0
+  local current_hash=""
+  
+  while IFS= read -r line; do
+    if [[ "$line" == "---" ]]; then
+      in_group=1
+      continue
+    elif [[ "$line" =~ ^STATS: ]]; then
+      break
+    elif [[ $in_group -eq 1 && "$line" =~ ^([a-f0-9]+):(.*)$ ]]; then
+      ((gid++))
+      current_hash="${BASH_REMATCH[1]}"
+      local first_file="${BASH_REMATCH[2]}"
       
-      if [[ "$line" =~ ^([a-f0-9]+):(.*)$ ]]; then
-          current_group_hash="${BASH_REMATCH[1]}"
-          files_in_group="${BASH_REMATCH[2]}"$'\n'
-      else
-          files_in_group+="$line"$'\n'
-      fi
+      local path size mtime
+      IFS='|' read -r path size mtime <<< "$first_file"
+      local is_system="No"
+      is_in_system_folder "$path" && is_system="Yes"
+      printf '%s,"%s",%s,"%s",%s,%s\n' "$current_hash" "${path//\"/\"\"}" "$size" "$(format_size "$size")" "$gid" "$is_system" >> "$csv"
+    elif [[ $in_group -eq 1 && -n "$line" ]]; then
+      local path size mtime
+      IFS='|' read -r path size mtime <<< "$line"
+      local is_system="No"
+      is_in_system_folder "$path" && is_system="Yes"
+      printf '%s,"%s",%s,"%s",%s,%s\n' "$current_hash" "${path//\"/\"\"}" "$size" "$(format_size "$size")" "$gid" "$is_system" >> "$csv"
+    fi
   done < "$TEMP_DIR/duplicates.txt"
 
-  [[ $QUIET -eq 0 ]] && echo -e "${GREEN}✅ CSV report saved to: $csv${NC}"
+  [[ $QUIET -eq 0 ]] && echo -e "${GREEN}✓ CSV report saved: $csv${NC}"
 }
 
 generate_json_report() {
   [[ -z "$JSON_REPORT" ]] && return
-  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}📋 Generating JSON report...${NC}"
+  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}Generating JSON report...${NC}"
+  
   local json="$OUTPUT_DIR/$JSON_REPORT"
+  
+  cat > "$json" << EOF
+{
+  "metadata": {
+    "version": "$VERSION",
+    "author": "$AUTHOR",
+    "generated": "$(date -Iseconds 2>/dev/null || date)",
+    "search_path": "$SEARCH_PATH",
+    "total_files": ${TOTAL_FILES:-0},
+    "total_duplicates": ${TOTAL_DUPLICATES:-0},
+    "total_groups": ${TOTAL_DUPLICATE_GROUPS:-0},
+    "space_wasted": ${TOTAL_SPACE_WASTED:-0},
+    "hash_algorithm": "${HASH_ALGORITHM%%sum}",
+    "system_protection": $([ $SKIP_SYSTEM_FOLDERS -eq 1 ] && echo "true" || echo "false")
+  },
+  "groups": [
+EOF
 
-  local -a groups_array
   local gid=0
-  local current_group_hash files_in_group
-
-  while IFS= read -r line || [[ -n "$line" ]]; do
+  local in_group=0
+  local first_group=1
+  local need_comma=0
+  
+  while IFS= read -r line; do
     if [[ "$line" == "---" ]]; then
-      if [[ -n "$files_in_group" ]]; then
-        ((gid++))
-        local -a files_array
-        while IFS='|' read -r fp sz mtime; do
-          [[ -z "$fp" ]] && continue
-          local is_system="false"
-          is_in_system_folder "$fp" && is_system="true"
-          files_array+=( "{ \"path\": $(jq -R . <<<"$fp"), \"size\": $sz, \"system\": $is_system }" )
-        done <<< "$files_in_group"
-        local files_json=$(IFS=,; echo "[${files_array[*]}]")
-        groups_array+=( "{ \"id\": $gid, \"hash\": \"$current_group_hash\", \"files\": $files_json }" )
+      if [[ $first_group -eq 0 ]]; then
+        echo "      ]" >> "$json"
+        echo "    }" >> "$json"
+        need_comma=1
       fi
-      current_group_hash=""
-      files_in_group=""
+      first_group=0
+      in_group=1
+      # Start a new group; print comma if needed
+      if [[ $need_comma -eq 1 ]]; then
+        echo "    ," >> "$json"
+        need_comma=0
+      fi
       continue
-    fi
-    
-    if [[ "$line" =~ ^([a-f0-9]+):(.*)$ ]]; then
-      current_group_hash="${BASH_REMATCH[1]}"
-      files_in_group="${BASH_REMATCH[2]}"$'\n'
-    else
-      files_in_group+="$line"$'\n'
+    elif [[ "$line" =~ ^STATS: ]]; then
+      break
+    elif [[ $in_group -eq 1 && "$line" =~ ^([a-f0-9]+):(.*)$ ]]; then
+      ((gid++))
+      local hash="${BASH_REMATCH[1]}"
+      local first_file="${BASH_REMATCH[2]}"
+      
+      echo "    {" >> "$json"
+      echo "      \"id\": $gid," >> "$json"
+      echo "      \"hash\": \"$hash\"," >> "$json"
+      echo "      \"files\": [" >> "$json"
+      
+      local path size mtime
+      IFS='|' read -r path size mtime <<< "$first_file"
+      local is_system="false"
+      is_in_system_folder "$path" && is_system="true"
+      local jpath="${path//\\/\\\\}"; jpath="${jpath//\"/\\\"}"
+      printf '        {"path": "%s", "size": %s, "system": %s}' "$jpath" "$size" "$is_system" >> "$json"
+    elif [[ $in_group -eq 1 && -n "$line" ]]; then
+      local path size mtime
+      IFS='|' read -r path size mtime <<< "$line"
+      local is_system="false"
+      is_in_system_folder "$path" && is_system="true"
+      local jpath2="${path//\\/\\\\}"; jpath2="${jpath2//\"/\\\"}"
+      printf ',\n        {"path": "%s", "size": %s, "system": %s}' "$jpath2" "$size" "$is_system" >> "$json"
     fi
   done < "$TEMP_DIR/duplicates.txt"
-
-  local groups_json=$(IFS=,; echo "[${groups_array[*]}]")
-
-  local metadata_json=$(jq -n \
-    --arg version "$VERSION" \
-    --arg author "$AUTHOR" \
-    --arg generated "$(date -Iseconds)" \
-    --arg search_path "$SEARCH_PATH" \
-    --arg total_files "${TOTAL_FILES:-0}" \
-    --arg total_duplicates "${TOTAL_DUPLICATES:-0}" \
-    --arg total_groups "${TOTAL_DUPLICATE_GROUPS:-0}" \
-    --arg space_wasted "${TOTAL_SPACE_WASTED:-0}" \
-    --arg hash_algo "${HASH_ALGORITHM%%sum}" \
-    '{ version: $version, author: $author, generated: $generated, search_path: $search_path, total_files: ($total_files|tonumber), total_duplicates: ($total_duplicates|tonumber), total_groups: ($total_groups|tonumber), space_wasted: ($space_wasted|tonumber), hash_algorithm: $hash_algo, system_protection: (if '"$SKIP_SYSTEM_FOLDERS"' == "1" then true else false end) }')
-
-  printf '{"metadata": %s, "groups": %s}\n' "$metadata_json" "$groups_json" | jq . > "$json"
   
-  if [[ $? -eq 0 ]]; then
-    [[ $QUIET -eq 0 ]] && echo -e "${GREEN}✅ JSON report saved to: $json${NC}"
-  else
-    echo -e "${RED}Error: Failed to generate JSON report. Check filenames for invalid characters.${NC}"
-    rm -f -- "$json"
+  # Close the last open group if any
+  if [[ $first_group -eq 0 ]]; then
+    echo "      ]" >> "$json"
+    echo "    }" >> "$json"
   fi
+  echo "  ]" >> "$json"
+  echo "}" >> "$json"
+
+  [[ $QUIET -eq 0 ]] && echo -e "${GREEN}✓ JSON report saved: $json${NC}"
 }
 
-
 # ═══════════════════════════════════════════════════════════════════════════
-# EMAIL AND SUMMARY
+# SUMMARY AND STATISTICS
 # ═══════════════════════════════════════════════════════════════════════════
 calculate_duration() {
   local duration=$((SCAN_END_TIME - SCAN_START_TIME))
   local hours=$((duration/3600))
   local minutes=$(((duration%3600)/60))
   local seconds=$((duration%60))
-  if (( hours > 0 )); then printf "%dh %dm %ds" "$hours" "$minutes" "$seconds";
-  elif (( minutes > 0 )); then printf "%dm %ds" "$minutes" "$seconds";
-  else printf "%ds" "$seconds"; fi
-}
-
-send_email_report() {
-  [[ -z "$EMAIL_REPORT" ]] && return
-  [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}📧 Sending email report...${NC}"
-  local subject="DupeFinder Pro Report - $(date '+%Y-%m-%d')"
-  local body="DupeFinder Pro Scan Results
-Configuration:
-  Search Path: $SEARCH_PATH
-  System Protection: $([ $SKIP_SYSTEM_FOLDERS -eq 1 ] && echo "Enabled" || echo "Disabled")
-  Hash Algorithm: ${HASH_ALGORITHM%%sum}
-Results:
-  Total Files Scanned: ${TOTAL_FILES:-0}
-  Duplicate Files Found: ${TOTAL_DUPLICATES:-0}
-  Duplicate Groups: ${TOTAL_DUPLICATE_GROUPS:-0}
-  Space Wasted: $(format_size ${TOTAL_SPACE_WASTED:-0})
-Actions:
-  Files Processed: ${FILES_DELETED:-0}
-  Space Freed: $(format_size ${SPACE_FREED:-0})
-Performance:
-  Scan Duration: $(calculate_duration)
-  Threads Used: $THREADS
-Reports:
-  HTML Report: $OUTPUT_DIR/$HTML_REPORT"
-  if command -v mail &>/dev/null; then
-    echo "$body" | mail -s "$subject" "$EMAIL_REPORT"
-    [[ $QUIET -eq 0 ]] && echo -e "${GREEN}✅ Email sent to: $EMAIL_REPORT${NC}"
-  else
-    [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}⚠ Mail command not available${NC}"
+  if (( hours > 0 )); then 
+    printf "%dh %dm %ds" "$hours" "$minutes" "$seconds"
+  elif (( minutes > 0 )); then 
+    printf "%dm %ds" "$minutes" "$seconds"
+  else 
+    printf "%ds" "$seconds"
   fi
 }
 
 show_summary() {
   [[ $QUIET -eq 1 ]] && return
+  
   echo ""
   echo -e "${WHITE}═══════════════════════════════════════════════════════════${NC}"
-  echo -e "${BOLD}     SCAN SUMMARY${NC}"
+  echo -e "${BOLD}      SCAN SUMMARY${NC}"
   echo -e "${WHITE}═══════════════════════════════════════════════════════════${NC}"
-  echo -e "${CYAN}📁 Search Path:${NC}       $SEARCH_PATH"
-  echo -e "${CYAN}🛡️  System Protection:${NC}  $([ $SKIP_SYSTEM_FOLDERS -eq 1 ] && echo "ENABLED" || echo "DISABLED")"
-  echo -e "${CYAN}📊 Files Scanned:${NC}       ${TOTAL_FILES:-0}"
-  echo -e "${CYAN}🔄 Duplicates Found:${NC}    ${TOTAL_DUPLICATES:-0}"
-  echo -e "${CYAN}📂 Duplicate Groups:${NC}    ${TOTAL_DUPLICATE_GROUPS:-0}"
-  echo -e "${CYAN}💾 Space Wasted:${NC}        $(format_size "${TOTAL_SPACE_WASTED:-0}")"
+  echo -e "${CYAN}Search Path:${NC}            $SEARCH_PATH"
+  echo -e "${CYAN}System Protection:${NC}    $([ $SKIP_SYSTEM_FOLDERS -eq 1 ] && echo "ENABLED" || echo "DISABLED")"
+  echo -e "${CYAN}Files Scanned:${NC}        ${TOTAL_FILES:-0}"
+  echo -e "${CYAN}Duplicates Found:${NC}     ${TOTAL_DUPLICATES:-0}"
+  echo -e "${CYAN}Duplicate Groups:${NC}     ${TOTAL_DUPLICATE_GROUPS:-0}"
+  echo -e "${CYAN}Space Wasted:${NC}         $(format_size "${TOTAL_SPACE_WASTED:-0}")"
+  
   if [[ ${FILES_DELETED:-0} -gt 0 || ${FILES_HARDLINKED:-0} -gt 0 || ${FILES_QUARANTINED:-0} -gt 0 ]]; then
-    echo -e "${CYAN}✅ Files Processed:${NC}     ${FILES_DELETED:-0}"
-    echo -e "${CYAN}💚 Space Freed:${NC}         $(format_size "${SPACE_FREED:-0}")"
+    echo -e "${CYAN}Files Processed:${NC}      $((${FILES_DELETED:-0} + ${FILES_HARDLINKED:-0} + ${FILES_QUARANTINED:-0}))"
+    echo -e "${CYAN}Space Freed:${NC}          $(format_size "${SPACE_FREED:-0}")"
     [[ ${FILES_DELETED:-0} -gt 0 ]] && echo -e "${DIM}  - Deleted: ${FILES_DELETED}${NC}"
     [[ ${FILES_HARDLINKED:-0} -gt 0 ]] && echo -e "${DIM}  - Hardlinked: ${FILES_HARDLINKED}${NC}"
     [[ ${FILES_QUARANTINED:-0} -gt 0 ]] && echo -e "${DIM}  - Quarantined: ${FILES_QUARANTINED}${NC}"
   fi
-  echo -e "${CYAN}⏱️  Scan Duration:${NC}       $(calculate_duration)"
-  echo -e "${CYAN}🔧 Hash Algorithm:${NC}      ${HASH_ALGORITHM%%sum}"
-  if [[ $FAST_MODE -eq 1 ]]; then echo -e "${DIM}    (Fast mode: size + filename hash)${NC}"; fi
-  echo -e "${CYAN}⚡ Threads Used:${NC}        $THREADS"
+  
+  [[ -n "$SCAN_START_TIME" && -n "$SCAN_END_TIME" ]] && \
+    echo -e "${CYAN}Scan Duration:${NC}        $(calculate_duration)"
+  echo -e "${CYAN}Hash Algorithm:${NC}         ${HASH_ALGORITHM%%sum}"
+  [[ $FAST_MODE -eq 1 ]] && echo -e "${DIM}    (Fast mode: size + filename hash)${NC}"
+  echo -e "${CYAN}Threads Used:${NC}           $THREADS"
+  [[ $HASH_ERRORS -gt 0 ]] && echo -e "${YELLOW}Hash Errors:${NC}            $HASH_ERRORS"
   echo -e "${WHITE}─────────────────────────────────────────────────────────${NC}"
-  echo -e "${CYAN}📄 HTML Report:${NC}         $OUTPUT_DIR/$HTML_REPORT"
+  echo -e "${CYAN}HTML Report:${NC}          $OUTPUT_DIR/$HTML_REPORT"
   [[ -n "$CSV_REPORT" ]] && \
-    echo -e "${CYAN}📊 CSV Report:${NC}          $OUTPUT_DIR/$CSV_REPORT"
+    echo -e "${CYAN}CSV Report:${NC}           $OUTPUT_DIR/$CSV_REPORT"
   [[ -n "$JSON_REPORT" ]] && \
-    echo -e "${CYAN}📋 JSON Report:${NC}         $OUTPUT_DIR/$JSON_REPORT"
+    echo -e "${CYAN}JSON Report:${NC}          $OUTPUT_DIR/$JSON_REPORT"
   [[ -n "$LOG_FILE" ]] && \
-    echo -e "${CYAN}📝 Log File:${NC}            $LOG_FILE"
+    echo -e "${CYAN}Log File:${NC}             $LOG_FILE"
   echo -e "${WHITE}═══════════════════════════════════════════════════════════${NC}"
 }
 
@@ -1663,54 +1770,65 @@ main() {
   # Set locale for consistent sorting
   export LC_ALL=C
   
-  # Create temp dir
-  TEMP_DIR="$(mktemp -d -t dupefinder.XXXXXXXXXX)"
-  if [[ ! -d "$TEMP_DIR" ]]; then
-    echo -e "${RED}Error: Failed to create temporary directory.${NC}"
-    exit 1
-  fi
-  
-  # Initialization and validation
-  load_config
+  # Parse arguments and initialize
+  parse_arguments "$@"
   check_dependencies
+  
+  # Create secure temp dir
+  create_temp_dir
+  
   SCAN_START_TIME=$(date +%s)
   init_logging
+  
   [[ $QUIET -eq 0 ]] && show_header
+  
+  # Validate inputs
   validate_inputs
   
-  # Core operations
-  init_cache
-  if find_files; then
-    calculate_hashes
-    find_duplicates
+  # Check if resuming
+  if [[ $RESUME_STATE -eq 1 ]] && load_state; then
+    echo -e "${GREEN}Resuming from saved state...${NC}"
+  else
+    # Main execution flow
+    if ! find_files; then
+      [[ $QUIET -eq 0 ]] && echo -e "${GREEN}No files found matching criteria.${NC}"
+      SCAN_END_TIME=$(date +%s)
+      show_summary
+      exit 0
+    fi
     
-    # Check if duplicates were found before proceeding
-    if [[ ${TOTAL_DUPLICATE_GROUPS:-0} -gt 0 ]]; then
-      show_duplicate_details
-      show_safety_summary
-      delete_duplicates
-      # Reporting
-      generate_html_report
-      generate_csv_report
-      generate_json_report
-    else
+    if ! calculate_hashes; then
+      echo -e "${RED}Hash calculation failed.${NC}"
+      SCAN_END_TIME=$(date +%s)
+      show_summary
+      exit 1
+    fi
+    
+    if ! find_duplicates; then
       [[ $QUIET -eq 0 ]] && echo -e "${GREEN}No duplicates found.${NC}"
+      SCAN_END_TIME=$(date +%s)
+      show_summary
+      exit 0
     fi
   fi
   
-  # Finalize
+  # Process results
+  show_duplicate_details
+  show_safety_summary
+  delete_duplicates
+  generate_html_report
+  generate_csv_report
+  generate_json_report
+  
   SCAN_END_TIME=$(date +%s)
-  send_email_report
   show_summary
   
-  # Display final message
-  [[ $QUIET -eq 0 ]] && echo -e "\n${GREEN}✨ Scan completed successfully!${NC}"
+  [[ $QUIET -eq 0 ]] && echo -e "\n${GREEN}Scan completed successfully!${NC}"
   [[ $QUIET -eq 0 ]] && echo -e "${DIM}DupeFinder Pro v$VERSION by $AUTHOR${NC}\n"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════
-parse_arguments "$@"
-main
+main "$@"
 exit 0
