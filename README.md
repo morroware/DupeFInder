@@ -103,61 +103,283 @@ sudo apt install sqlite3 lsof bc trash-cli jq ssdeep mailutils gawk
 
 ## 📚 Usage Examples
 
-### 🏠 **Home Directory Cleanup**
+### 👤 **Beginner - Home User Scenarios**
+
+#### 🧹 **Clean Up Downloads Folder**
 ```bash
-# Clean up Downloads with interactive confirmation
-./dupefinder.sh \
-  --path ~/Downloads \
-  --min-size 1M \
-  --interactive \
-  --trash \
-  --verbose
+# Safe cleanup of Downloads with preview
+./dupefinder.sh --path ~/Downloads --interactive --trash --verbose
 ```
 
-### 📸 **Photo Management**
+#### 📱 **Organize Phone Photos**
 ```bash
-# Find duplicate photos, keep newest
+# Find duplicate photos from phone sync, keep newest
 ./dupefinder.sh \
   --path ~/Pictures \
-  --pattern "*.jpg" --pattern "*.png" --pattern "*.jpeg" \
+  --pattern "*.jpg" --pattern "*.jpeg" --pattern "*.png" \
   --keep-newest \
-  --delete \
-  --backup ~/photo_backups \
-  --csv photo_duplicates.csv
-```
-
-### 💾 **Storage Optimization**
-```bash
-# Replace duplicates with hardlinks to save space
-./dupefinder.sh \
-  --path ~/Documents \
-  --min-size 100K \
-  --hardlink \
+  --interactive \
   --verbose
 ```
 
-### 🔍 **Similar File Detection**
+#### 🎵 **Music Library Cleanup**
 ```bash
-# Find similar files using fuzzy matching
+# Find duplicate music files, move to quarantine for review
 ./dupefinder.sh \
   --path ~/Music \
-  --fuzzy \
-  --threshold 90 \
-  --quarantine ~/similar_files
+  --pattern "*.mp3" --pattern "*.flac" --pattern "*.m4a" \
+  --min-size 1M \
+  --quarantine ~/duplicate_music_review \
+  --verbose
 ```
 
-### 🏢 **Enterprise Scanning**
+#### 📄 **Document Organization**
 ```bash
-# High-performance scan with full reporting
+# Find duplicate documents, backup before deletion
 ./dupefinder.sh \
-  --path /data/shared \
+  --path ~/Documents \
+  --pattern "*.pdf" --pattern "*.doc*" --pattern "*.txt" \
+  --backup ~/document_backups \
+  --interactive \
+  --csv document_duplicates.csv
+```
+
+### 🔧 **Intermediate - Power User Scenarios**
+
+#### 💿 **Media Collection Management**
+```bash
+# Comprehensive media cleanup with hardlinks to save space
+./dupefinder.sh \
+  --path ~/Media \
+  --pattern "*.mkv" --pattern "*.mp4" --pattern "*.avi" \
+  --min-size 50M \
+  --hardlink \
+  --keep-newest \
+  --csv media_report.csv \
+  --verbose
+```
+
+#### 🖼️ **Photography Workflow**
+```bash
+# Professional photo management with similarity detection
+./dupefinder.sh \
+  --path ~/Photography \
+  --pattern "*.raw" --pattern "*.cr2" --pattern "*.nef" \
+  --fuzzy \
+  --threshold 85 \
+  --keep-path ~/Photography/edited \
+  --backup ~/photo_backups \
+  --json photo_analysis.json
+```
+
+#### 🎮 **Game Files Cleanup**
+```bash
+# Find duplicate game files and installers
+./dupefinder.sh \
+  --path ~/Games \
+  --pattern "*.zip" --pattern "*.exe" --pattern "*.msi" \
+  --min-size 10M \
+  --smart-delete \
+  --quarantine ~/game_duplicates \
+  --log ~/game_cleanup.log
+```
+
+#### 💾 **Backup Verification**
+```bash
+# Verify backup integrity and find redundant backups
+./dupefinder.sh \
+  --path ~/Backups \
+  --sha256 \
+  --verify \
+  --csv backup_analysis.csv \
+  --json backup_report.json \
+  --threads 4
+```
+
+#### 📚 **Digital Library Management**
+```bash
+# Organize ebooks and documents with fuzzy matching
+./dupefinder.sh \
+  --path ~/Library \
+  --pattern "*.pdf" --pattern "*.epub" --pattern "*.mobi" \
+  --fuzzy \
+  --threshold 92 \
+  --keep-newest \
+  --csv library_duplicates.csv \
+  --verbose
+```
+
+### 🏢 **Advanced - System Administrator Scenarios**
+
+#### 🖥️ **Workstation Maintenance**
+```bash
+# Safe system-wide scan excluding critical areas
+./dupefinder.sh \
+  --path / \
+  --skip-system \
+  --min-size 10M \
+  --exclude /proc --exclude /sys --exclude /dev \
+  --dry-run \
+  --threads 6 \
+  --csv workstation_analysis.csv \
+  --log /var/log/dupefinder.log
+```
+
+#### 📁 **Shared Network Storage**
+```bash
+# Enterprise file server cleanup with comprehensive reporting
+./dupefinder.sh \
+  --path /mnt/fileserver \
+  --min-size 1M \
   --threads 8 \
   --cache \
   --sha256 \
-  --csv report.csv \
-  --json report.json \
+  --smart-delete \
+  --backup /backup/before_cleanup \
+  --csv /reports/fileserver_duplicates.csv \
+  --json /reports/fileserver_analysis.json \
+  --email sysadmin@company.com \
+  --log /var/log/fileserver_cleanup.log
+```
+
+#### 👥 **User Home Directory Audit**
+```bash
+# Scan all user directories for duplicates
+for user in $(ls /home); do
+  echo "Scanning /home/$user"
+  ./dupefinder.sh \
+    --path "/home/$user" \
+    --min-size 5M \
+    --dry-run \
+    --csv "/reports/${user}_duplicates.csv" \
+    --quiet
+done
+```
+
+#### 🗄️ **Database Storage Optimization**
+```bash
+# Find duplicate database dumps and backups
+./dupefinder.sh \
+  --path /var/backups/databases \
+  --pattern "*.sql" --pattern "*.dump" --pattern "*.bak" \
+  --keep-newest \
+  --hardlink \
+  --threads 4 \
+  --csv database_backup_analysis.csv \
+  --log /var/log/db_cleanup.log
+```
+
+#### 📦 **Software Repository Management**
+```bash
+# Clean up package caches and installers
+./dupefinder.sh \
+  --path /opt/software \
+  --pattern "*.deb" --pattern "*.rpm" --pattern "*.tar.gz" \
+  --min-size 1M \
+  --keep-newest \
+  --quarantine /opt/duplicate_packages \
+  --csv package_duplicates.csv \
+  --verbose
+```
+
+#### 🔧 **Log File Management**
+```bash
+# Find duplicate log files across the system
+./dupefinder.sh \
+  --path /var/log \
+  --pattern "*.log" --pattern "*.log.*" \
+  --exclude /var/log/journal \
+  --min-size 1M \
+  --keep-newest \
+  --dry-run \
+  --csv log_duplicates.csv
+```
+
+#### 🌐 **Web Server Content**
+```bash
+# Web server asset deduplication
+./dupefinder.sh \
+  --path /var/www \
+  --pattern "*.jpg" --pattern "*.png" --pattern "*.css" --pattern "*.js" \
+  --hardlink \
+  --backup /backup/web_assets \
+  --threads 6 \
+  --json web_asset_analysis.json \
+  --log /var/log/web_cleanup.log
+```
+
+#### 🚀 **High-Performance Mass Storage**
+```bash
+# Large-scale storage system with resume capability
+./dupefinder.sh \
+  --path /storage/archive \
+  --min-size 100M \
+  --threads 16 \
+  --cache \
+  --sha512 \
+  --resume \
+  --csv /reports/massive_scan.csv \
+  --json /reports/massive_analysis.json \
+  --email storage-team@company.com \
+  --log /var/log/massive_scan.log
+```
+
+#### 🔄 **Automated Scheduled Cleanup**
+```bash
+#!/bin/bash
+# Weekly automated cleanup script for cron
+./dupefinder.sh \
+  --path /data/shared \
+  --min-size 10M \
+  --smart-delete \
+  --cache \
+  --csv "/reports/weekly_$(date +%Y%m%d).csv" \
   --email admin@company.com \
-  --log /var/log/dupefinder.log
+  --log /var/log/weekly_cleanup.log \
+  --quiet
+
+# Add to crontab: 0 2 * * 0 /path/to/weekly_cleanup.sh
+```
+
+### 🧪 **Specialized Use Cases**
+
+#### 🔬 **Scientific Data Management**
+```bash
+# Research data with high precision verification
+./dupefinder.sh \
+  --path /research/datasets \
+  --pattern "*.csv" --pattern "*.xlsx" --pattern "*.dat" \
+  --sha512 \
+  --verify \
+  --keep-oldest \
+  --backup /research/backups \
+  --json research_analysis.json
+```
+
+#### 🎬 **Video Production**
+```bash
+# Video editing project cleanup
+./dupefinder.sh \
+  --path /projects/video \
+  --pattern "*.mov" --pattern "*.mp4" --pattern "*.avi" \
+  --min-size 100M \
+  --fuzzy \
+  --threshold 95 \
+  --quarantine /projects/duplicate_review \
+  --csv video_duplicates.csv
+```
+
+#### 🏗️ **Development Environment**
+```bash
+# Clean up development artifacts
+./dupefinder.sh \
+  --path ~/dev \
+  --exclude ~/dev/.git \
+  --pattern "*.tar.gz" --pattern "*.zip" --pattern "node_modules" \
+  --min-size 1M \
+  --smart-delete \
+  --csv dev_cleanup.csv \
+  --verbose
 ```
 
 ## ⚙️ Command Reference
@@ -370,7 +592,5 @@ echo "duplicate content" > test/dir2/file1.txt
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-
 
 *DupeFinder v1.2.4 - Advanced Duplicate File Manager*
