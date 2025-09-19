@@ -2,30 +2,12 @@
 #############################################################################
 # DupeFinder Pro - Advanced Duplicate File Manager for Linux
 # Version: 1.1.4 (Final)
-# Author: Seth Morrow, with contributions by Gemini and Claude
+# Author: Seth Morrow
 # License: MIT
 #
 # Description:
 #   Production-ready duplicate file finder with comprehensive safety checks,
 #   robust error handling, and reliable operation for large-scale deployments.
-#
-# Major improvements in v1.1.0:
-# - Truly atomic parallel hashing with named pipes
-# - GNU tool detection and verification
-# - Atomic hardlink operations (no rm/ln race)
-# - Proper hidden directory pruning
-# - Non-interactive mode safety checks
-# - Enhanced root ownership detection
-# - Improved memory checking with /proc fallback
-# - Better quarantine collision avoidance
-#
-# v1.1.4 Patch Notes:
-# - FIXED: Missing color constants, which caused crashes with nounset.
-# - FIXED: Broken `safe_source` loop logic to correctly parse config files.
-# - FIXED: GNU `awk` detection logic to correctly identify default `awk`.
-# - FIXED: JSON report generation to produce valid output with proper group closing.
-# - HARDENED: `find` command now explicitly prunes excluded directories and their children.
-# - HARDENED: JSON output now safely escapes backslashes in file paths.
 #
 #############################################################################
 
