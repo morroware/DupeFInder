@@ -422,6 +422,14 @@ format_size() {
 # ═══════════════════════════════════════════════════════════════════════════
 # SAFE FILE OPERATIONS
 # ═══════════════════════════════════════════════════════════════════════════
+
+# Escape a string for safe use in SQLite queries
+sql_escape() {
+  local str="$1"
+  # SQLite uses doubled single quotes for escaping
+  printf '%s' "${str//\'/\'\'}"
+}
+
 safe_stat() {
   local file="$1"
   local format="$2"
@@ -650,7 +658,9 @@ safe_source() {
       local key="${BASH_REMATCH[1]}"
       local val="${BASH_REMATCH[2]}"
 
-      if [[ "$val" =~ [\`\$\(;\)] ]]; then
+      # Check for unsafe shell characters in value (backticks, $, (), ;)
+      local unsafe_pattern='[`$();]'
+      if [[ "$val" =~ $unsafe_pattern ]]; then
           log_action "error" "Unsafe value rejected for $key in $1"
           continue
       fi
@@ -986,27 +996,41 @@ find_files() {
   
   [[ -n "$MAX_DEPTH" ]] && args+=(-maxdepth "$MAX_DEPTH")
   
+  # Build exclusion list for find command
   if [[ ${#EXCLUDE_PATHS[@]} -gt 0 || $HIDDEN_FILES -eq 0 ]]; then
     args+=( \( )
     local first=1
+    # Exclude hidden directories if not including hidden files
     if [[ $HIDDEN_FILES -eq 0 ]]; then
-      args+=( -type d -path '*/.*' )
+      args+=( -name '.*' )
       first=0
     fi
+    # Add each exclusion path
     for ex in "${EXCLUDE_PATHS[@]}"; do
+      # Normalize path - remove trailing slash if present
+      ex="${ex%/}"
       if [[ $first -eq 1 ]]; then
-        args+=( -path "$ex" -o -path "$ex/*" )
+        args+=( -path "$ex" )
         first=0
       else
-        args+=( -o -path "$ex" -o -path "$ex/*" )
+        args+=( -o -path "$ex" )
       fi
+      # Also exclude subdirectories of the excluded path
+      args+=( -o -path "$ex/*" )
     done
     args+=( \) -prune -o )
   fi
 
   args+=(-type f)
-  [[ $MIN_SIZE -gt 0 ]] && args+=(-size "+${MIN_SIZE}c")
-  [[ -n "$MAX_SIZE" ]] && args+=(-size "-${MAX_SIZE}c")
+  # find -size +Nc means "strictly greater than N", so use MIN_SIZE-1 to include files of exactly MIN_SIZE
+  if [[ $MIN_SIZE -gt 1 ]]; then
+    args+=(-size "+$((MIN_SIZE - 1))c")
+  elif [[ $MIN_SIZE -eq 1 ]]; then
+    # For MIN_SIZE=1, we want files >= 1 byte (exclude empty files)
+    args+=(-size "+0c")
+  fi
+  # find -size -Nc means "strictly less than N", so use MAX_SIZE+1 to include files of exactly MAX_SIZE
+  [[ -n "$MAX_SIZE" ]] && args+=(-size "-$((MAX_SIZE + 1))c")
 
   if [[ ${#FILE_PATTERN[@]} -gt 0 ]]; then
     args+=( \( )
@@ -1060,7 +1084,8 @@ hash_file_with_timeout() {
   
   if [[ $USE_CACHE -eq 1 ]]; then
     local cached_hash
-    local sql_path="${file//\'/\'\'}"
+    local sql_path
+    sql_path=$(sql_escape "$file")
     cached_hash=$(sqlite3 "$DB_CACHE" "SELECT hash FROM files WHERE path='$sql_path' AND mtime=$mtime AND size=$size;" 2>/dev/null)
     if [[ -n "$cached_hash" ]]; then
       result="${cached_hash}${DELIM}${size}${DELIM}${mtime}${DELIM}${file}"
@@ -1078,20 +1103,32 @@ hash_file_with_timeout() {
   else
     local hash try=0
     while :; do
-      if hash=$( $IONICE_PREFIX $NICE_PREFIX timeout "$HASH_TIMEOUT" "$algo" -- "$file" 2>/dev/null | cut -d' ' -f1 ); then
+      hash=$( $IONICE_PREFIX $NICE_PREFIX timeout "$HASH_TIMEOUT" "$algo" -- "$file" 2>/dev/null | cut -d' ' -f1 )
+      local exit_code=$?
+      # Check for timeout (exit code 124) or other failure, or empty hash
+      if [[ $exit_code -eq 0 && -n "$hash" ]]; then
         break
       fi
       ((try++))
-      [[ $try -ge $MAX_RETRIES ]] && { ((HASH_ERRORS++)); log_action "warning" "Hash failed after $MAX_RETRIES: $file"; return 1; }
+      if [[ $try -ge $MAX_RETRIES ]]; then
+        ((HASH_ERRORS++))
+        if [[ $exit_code -eq 124 ]]; then
+          log_action "warning" "Hash timeout after $MAX_RETRIES attempts: $file"
+        else
+          log_action "warning" "Hash failed after $MAX_RETRIES attempts: $file"
+        fi
+        return 1
+      fi
       sleep 1
     done
-    [[ -n "$hash" ]] && result="${hash}${DELIM}${size}${DELIM}${mtime}${DELIM}${file}"
+    result="${hash}${DELIM}${size}${DELIM}${mtime}${DELIM}${file}"
   fi
   
   if [[ $USE_CACHE -eq 1 && -n "$result" ]]; then
     local hash_val
     hash_val=$(echo "$result" | cut -d"$DELIM" -f1)
-    local sql_path="${file//\'/\'\'}"
+    local sql_path
+    sql_path=$(sql_escape "$file")
     sqlite3 "$DB_CACHE" "INSERT OR REPLACE INTO files (path, hash, size, mtime) VALUES ('$sql_path', '$hash_val', $size, $mtime);" 2>/dev/null || \
       log_action "warning" "Failed to cache hash for: $file"
   fi
@@ -1114,9 +1151,9 @@ calculate_hashes() {
   local mode_text="standard"
   [[ $FAST_MODE -eq 1 ]] && mode_text="fast"
   [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}Calculating file hashes ($mode_text mode, threads: $THREADS)...${NC}"
-  
+
   [[ $TOTAL_FILES -eq 0 ]] && return
-  
+
   local available_mb
   available_mb=$(get_available_mb 2>/dev/null || echo 0)
   if [[ "$available_mb" -gt 0 && "$available_mb" -lt 500 ]]; then
@@ -1126,14 +1163,28 @@ calculate_hashes() {
       [[ $VERBOSE -eq 1 ]] && echo -e "${YELLOW}Reduced to $THREADS threads due to low memory (${available_mb}MB free).${NC}"
     fi
   fi
-  
+
   local hashes_temp="$TEMP_DIR/hashes.temp"
   : > "$hashes_temp"
-  
+
   local pipe="$TEMP_DIR/hashpipe"
-  mkfifo "$pipe"
+  local cat_pid=""
+
+  # Cleanup function for pipe resources
+  cleanup_pipe() {
+    [[ -n "$cat_pid" ]] && kill "$cat_pid" 2>/dev/null || true
+    wait "$cat_pid" 2>/dev/null || true
+    rm -f -- "$pipe" 2>/dev/null || true
+  }
+
+  # Create pipe with error handling
+  if ! mkfifo "$pipe" 2>/dev/null; then
+    log_action "error" "Failed to create named pipe for hash processing"
+    return 1
+  fi
+
   ( cat < "$pipe" > "$hashes_temp" ) &
-  local cat_pid=$!
+  cat_pid=$!
   
   local file_count=0
   local active_jobs=0
@@ -1142,9 +1193,9 @@ calculate_hashes() {
     ((file_count++))
     ((FILES_PROCESSED++))
     
-    if [[ $VERBOSE -eq 1 && $QUIET -eq 0 ]]; then
+    if [[ $VERBOSE -eq 1 && $QUIET -eq 0 && $TOTAL_FILES -gt 0 ]]; then
       local percentage=$((file_count * 100 / TOTAL_FILES))
-      local filled=$((percentage/2))
+      local filled=$((percentage / 2))
       local bar_chars=$(printf '%*s' "$filled" '' | tr ' ' '#')
       printf "\r${YELLOW}Hashing: [%-50s] %3d%%${NC}" "$bar_chars" "$percentage"
     fi
@@ -1160,19 +1211,21 @@ calculate_hashes() {
       ((active_jobs--))
     fi
   done < "$TEMP_DIR/files.list"
-  
+
+  # Wait for all background jobs to complete
   wait
-  wait "$cat_pid" 2>/dev/null || true
-  rm -f -- "$pipe"
-  
+
+  # Clean up the pipe and cat process
+  cleanup_pipe
+
   [[ $VERBOSE -eq 1 && $QUIET -eq 0 ]] && echo ""
-  
+
   if [[ ! -s "$hashes_temp" ]]; then
     echo -e "${RED}Error: No files were successfully hashed.${NC}"
     [[ $HASH_ERRORS -gt 0 ]] && echo -e "${YELLOW}Hash errors: $HASH_ERRORS${NC}"
     return 1
   fi
-  
+
   mv -- "$hashes_temp" "$TEMP_DIR/hashes.txt"
   [[ $QUIET -eq 0 ]] && echo -e "${GREEN}Hash calculation completed${NC}"
   [[ $HASH_ERRORS -gt 0 ]] && echo -e "${YELLOW}Warning: $HASH_ERRORS files could not be hashed${NC}"
@@ -1191,11 +1244,12 @@ find_duplicates() {
   
   sort -z -t"$DELIM" -k1,1 < "$TEMP_DIR/hashes.txt" | \
   "$AWK_BIN" -v DELIM="$DELIM" -v RS='\0' -v ORS='\0' '
-  BEGIN { 
-    prev_hash = ""; 
-    dup_count = 0; 
-    wasted = 0; 
+  BEGIN {
+    prev_hash = "";
+    dup_count = 0;
+    wasted = 0;
     gcount = 0;
+    in_group = 0;
   }
   
   {
@@ -1508,11 +1562,18 @@ delete_duplicates() {
     return
   fi
 
+  # Verify duplicates file exists and is readable
+  if [[ ! -f "$TEMP_DIR/duplicates.nul" || ! -r "$TEMP_DIR/duplicates.nul" ]]; then
+    log_action "error" "Duplicates file not found or not readable"
+    echo -e "${RED}Error: Duplicates file not found or not readable${NC}"
+    return 1
+  fi
+
   [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}Processing duplicate files...${NC}"
-  
+
   local gid=0
   local -a current_group=()
-  
+
   while IFS= read -r -d '' rec; do
     local type
     type=$(printf '%s' "$rec" | cut -d"$TAB" -f1)
