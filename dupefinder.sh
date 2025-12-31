@@ -81,10 +81,10 @@ LOG_FILE=""
 VERIFY_MODE=0
 USE_PARALLEL=0
 RESUME_STATE=0
-LSOF_CHECKS=1
+LSOF_CHECKS=0  # Disabled by default - lsof is slow for large file sets
 TEMP_DIR=""
 MEMORY_CHECK_INTERVAL=100 # Check memory every N files
-readonly VERSION="1.2.4"
+readonly VERSION="1.3.0"  # Performance improvements: xargs parallelism, partial hashing
 readonly AUTHOR="Seth Morrow"
 readonly MAX_MEMORY_MB=2048 # Maximum memory usage in MB
 readonly HASH_TIMEOUT=30   # Timeout for hash calculation per file
@@ -246,12 +246,29 @@ trap cleanup EXIT
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECURE TEMPORARY DIRECTORY CREATION (FIXED for atomic mv)
+# Uses /tmp for high IOPS and proper FIFO/socket support instead of OUTPUT_DIR
 # ═══════════════════════════════════════════════════════════════════════════
 create_temp_dir() {
-  local temp_base="$OUTPUT_DIR"
+  # Use /tmp or /var/tmp for performance - named pipes and SQLite work poorly on network shares
+  local temp_base=""
   local attempt=0
-  
-  mkdir -p -- "$temp_base" 2>/dev/null || error_exit "Cannot create or access output directory: $temp_base"
+
+  # Try to find a suitable temp location
+  for candidate in "${TMPDIR:-}" "/tmp" "/var/tmp"; do
+    if [[ -n "$candidate" && -d "$candidate" && -w "$candidate" ]]; then
+      temp_base="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$temp_base" ]]; then
+    # Fallback to OUTPUT_DIR if no temp location available
+    temp_base="$OUTPUT_DIR"
+    [[ $VERBOSE -eq 1 ]] && echo -e "${YELLOW}Warning: Using OUTPUT_DIR for temp files (no /tmp available)${NC}"
+  fi
+
+  # Ensure output directory exists for final reports
+  mkdir -p -- "$OUTPUT_DIR" 2>/dev/null || error_exit "Cannot create or access output directory: $OUTPUT_DIR"
 
   local perms owner p_group p_other
   owner=$(stat -c "%U" "$OUTPUT_DIR")
@@ -259,19 +276,19 @@ create_temp_dir() {
   if [[ "$owner" != "$ME" || ! -O "$OUTPUT_DIR" || "$p_group" =~ [2367] || "$p_other" =~ [2367] ]]; then
     error_exit "Output directory '$OUTPUT_DIR' is unsafe (must be owned by current user and not group/other-writable)"
   fi
-  
+
   while [[ $attempt -lt 5 ]]; do
     TEMP_DIR=$(mktemp -d -p "$temp_base" dupefinder.XXXXXXXXXX 2>/dev/null) || {
       ((attempt++)); sleep 1; continue
     }
-    
+
     if [[ -d "$TEMP_DIR" ]]; then
       chmod 700 "$TEMP_DIR" || { rm -rf -- "$TEMP_DIR"; error_exit "Failed to secure temporary directory"; }
       log_action "info" "Created secure temp directory: $TEMP_DIR"
       return 0
     fi
   done
-  
+
   error_exit "Failed to create temporary directory after $attempt attempts"
 }
 
@@ -323,7 +340,7 @@ ${BOLD}SEARCH:${NC}
     ${GREEN}-a, --all${NC}             Include hidden files
     ${GREEN}-l, --level DEPTH${NC}     Max directory depth
     ${GREEN}-t, --pattern GLOB${NC}    File pattern (e.g., "*.jpg")
-    ${GREEN}--fast${NC}                Fast mode (size+name hash)
+    ${GREEN}--fast${NC}                Fast mode (size + first 64KB hash)
     ${GREEN}--verify${NC}              Byte-by-byte verification before deletion
     ${GREEN}--fuzzy${NC}               Fuzzy matching for similar files (requires ssdeep)
     ${GREEN}--threshold PCT${NC}       Similarity threshold for fuzzy matching (default: 95)
@@ -362,6 +379,7 @@ ${BOLD}ADVANCED:${NC}
     ${GREEN}--exclude-list FILE${NC}   File with paths to exclude
     ${GREEN}--resume${NC}              Resume from a previous interrupted scan
     ${GREEN}--cache${NC}               Use a file-based cache for faster re-scans
+    ${GREEN}--enable-lsof${NC}         Enable lsof checks for open files (slow on large sets)
 
 ${BOLD}EXAMPLES:${NC}
     # Safe system-wide scan
@@ -648,10 +666,20 @@ safe_source() {
   local -a allowed_vars=("SEARCH_PATH" "OUTPUT_DIR" "HASH_ALGORITHM" "SCAN_START_TIME" "STATE_DUPS_FILE" "FILES_PROCESSED" "EXCLUDE_PATHS" "MIN_SIZE" "MAX_SIZE" "DELETE_MODE" "DRY_RUN" "VERBOSE" "QUIET" "FOLLOW_SYMLINKS" "EMPTY_FILES" "HIDDEN_FILES" "MAX_DEPTH" "FILE_PATTERN" "INTERACTIVE_DELETE" "KEEP_NEWEST" "KEEP_OLDEST" "KEEP_PATH_PRIORITY" "BACKUP_DIR" "USE_TRASH" "HARDLINK_MODE" "QUARANTINE_DIR" "USE_CACHE" "THREADS" "EMAIL_REPORT" "CONFIG_FILE" "FUZZY_MATCH" "SIMILARITY_THRESHOLD" "SAVE_CHECKSUMS" "CHECKSUM_DB" "EXCLUDE_LIST_FILE" "FAST_MODE" "SMART_DELETE" "LOG_FILE" "VERIFY_MODE" "USE_PARALLEL" "RESUME_STATE" "LSOF_CHECKS")
 
   while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line%%#*}"
+    # Only strip comments if # is at start or preceded by whitespace
+    # This preserves paths like /mnt/drive#1
+    if [[ "$line" =~ ^[[:space:]]*# ]]; then
+      # Line starts with optional whitespace then #, skip it
+      continue
+    fi
+    # Strip inline comments only if # is preceded by whitespace
+    if [[ "$line" =~ ^(.*)([[:space:]]#.*)$ ]]; then
+      line="${BASH_REMATCH[1]}"
+    fi
+    # Trim leading/trailing whitespace
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
-    
+
     [[ -z "$line" ]] && continue
     
     if [[ "$line" =~ ^([[:alnum:]_]+)=(.*)$ ]]; then
@@ -765,6 +793,7 @@ parse_arguments() {
         EXCLUDE_LIST_FILE="$2"; shift 2 ;;
       --resume) RESUME_STATE=1; shift ;;
       --cache) USE_CACHE=1; shift ;;
+      --enable-lsof) LSOF_CHECKS=1; shift ;;  # Opt-in for slow lsof checks
       --config)
         [[ $# -lt 2 || "$2" == -* ]] && error_exit "$arg requires a filename"
         safe_source "$2"; shift 2 ;;
@@ -1097,9 +1126,16 @@ hash_file_with_timeout() {
   fi
   
   if [[ "$fast" == "1" ]]; then
-    local name_hash
-    name_hash=$(printf '%s' "$(basename -- "$file")" | md5sum | cut -d' ' -f1)
-    result="${size}_${name_hash:0:16}${DELIM}${size}${DELIM}${mtime}${DELIM}${file}"
+    # Fast mode: Hash first 64KB of the file instead of just the name
+    # This is much more accurate than name-based matching while still being fast
+    local partial_hash
+    partial_hash=$(head -c 65536 -- "$file" 2>/dev/null | md5sum | cut -d' ' -f1)
+    if [[ -z "$partial_hash" ]]; then
+      ((HASH_ERRORS++))
+      log_action "warning" "Fast mode partial hash failed: $file"
+      return 1
+    fi
+    result="${size}_${partial_hash}${DELIM}${size}${DELIM}${mtime}${DELIM}${file}"
   else
     local hash try=0
     while :; do
@@ -1136,16 +1172,40 @@ hash_file_with_timeout() {
   [[ -n "$result" ]] && printf '%s\0' "$result"
 }
 
-wait_one_job() {
-  if ( wait -n ) 2>/dev/null; then
-    return 0
+# Standalone hash worker function for xargs - outputs null-terminated hash records
+# This is called by xargs with file path as argument
+_hash_worker() {
+  local file="$1"
+  local algo="$DUPEFINDER_ALGO"
+  local fast="$DUPEFINDER_FAST"
+  local delim=$'\t'
+
+  [[ ! -f "$file" ]] && return 1
+
+  local mtime size
+  mtime=$(stat -c "%Y" -- "$file" 2>/dev/null || echo "0")
+  size=$(stat -c "%s" -- "$file" 2>/dev/null || echo "0")
+
+  local result=""
+
+  if [[ "$fast" == "1" ]]; then
+    # Fast mode: Hash first 64KB of the file
+    local partial_hash
+    partial_hash=$(head -c 65536 -- "$file" 2>/dev/null | md5sum | cut -d' ' -f1)
+    [[ -z "$partial_hash" ]] && return 1
+    result="${size}_${partial_hash}${delim}${size}${delim}${mtime}${delim}${file}"
+  else
+    local hash
+    hash=$(timeout "${DUPEFINDER_TIMEOUT:-30}" "$algo" -- "$file" 2>/dev/null | cut -d' ' -f1)
+    [[ -z "$hash" ]] && return 1
+    result="${hash}${delim}${size}${delim}${mtime}${delim}${file}"
   fi
-  local jp
-  for jp in $(jobs -p); do
-    wait "$jp" && return 0
-  done
-  return 0
+
+  [[ -n "$result" ]] && printf '%s\0' "$result"
 }
+
+# Export the worker function for xargs
+export -f _hash_worker
 
 calculate_hashes() {
   local mode_text="standard"
@@ -1165,69 +1225,42 @@ calculate_hashes() {
   fi
 
   local hashes_temp="$TEMP_DIR/hashes.temp"
-  : > "$hashes_temp"
 
-  local pipe="$TEMP_DIR/hashpipe"
-  local cat_pid=""
+  # Export variables needed by the worker function
+  export DUPEFINDER_ALGO="$HASH_ALGORITHM"
+  export DUPEFINDER_FAST="$FAST_MODE"
+  export DUPEFINDER_TIMEOUT="$HASH_TIMEOUT"
 
-  # Cleanup function for pipe resources
-  cleanup_pipe() {
-    [[ -n "$cat_pid" ]] && kill "$cat_pid" 2>/dev/null || true
-    wait "$cat_pid" 2>/dev/null || true
-    rm -f -- "$pipe" 2>/dev/null || true
-  }
-
-  # Create pipe with error handling
-  if ! mkfifo "$pipe" 2>/dev/null; then
-    log_action "error" "Failed to create named pipe for hash processing"
-    return 1
+  # Use xargs for parallel processing - much more efficient than spawning subshells
+  # This eliminates the "fork bomb" issue by using a process pool
+  if [[ $VERBOSE -eq 1 && $QUIET -eq 0 ]]; then
+    echo -e "${DIM}Processing files with xargs -P $THREADS...${NC}"
   fi
 
-  ( cat < "$pipe" > "$hashes_temp" ) &
-  cat_pid=$!
-  
-  local file_count=0
-  local active_jobs=0
-  
-  while IFS= read -r -d '' file; do
-    ((file_count++))
-    ((FILES_PROCESSED++))
-    
-    if [[ $VERBOSE -eq 1 && $QUIET -eq 0 && $TOTAL_FILES -gt 0 ]]; then
-      local percentage=$((file_count * 100 / TOTAL_FILES))
-      local filled=$((percentage / 2))
-      local bar_chars=$(printf '%*s' "$filled" '' | tr ' ' '#')
-      printf "\r${YELLOW}Hashing: [%-50s] %3d%%${NC}" "$bar_chars" "$percentage"
-    fi
-    
-    {
-      hash_file_with_timeout "$file" "$HASH_ALGORITHM" "$FAST_MODE"
-    } > "$pipe" &
-    
-    ((active_jobs++))
-    
-    if [[ $active_jobs -ge $THREADS ]]; then
-      wait_one_job
-      ((active_jobs--))
-    fi
-  done < "$TEMP_DIR/files.list"
+  # xargs -0: null-terminated input, -P: parallel processes, -n1: one file per invocation
+  # The worker outputs null-terminated records which are collected into hashes.temp
+  if ! xargs -0 -P "$THREADS" -n 1 bash -c '_hash_worker "$@"' _ < "$TEMP_DIR/files.list" > "$hashes_temp" 2>/dev/null; then
+    log_action "warning" "Some files may have failed to hash"
+  fi
 
-  # Wait for all background jobs to complete
-  wait
+  # Count processed files
+  FILES_PROCESSED=$TOTAL_FILES
 
-  # Clean up the pipe and cat process
-  cleanup_pipe
-
-  [[ $VERBOSE -eq 1 && $QUIET -eq 0 ]] && echo ""
+  # Clean up exported variables
+  unset DUPEFINDER_ALGO DUPEFINDER_FAST DUPEFINDER_TIMEOUT
 
   if [[ ! -s "$hashes_temp" ]]; then
     echo -e "${RED}Error: No files were successfully hashed.${NC}"
-    [[ $HASH_ERRORS -gt 0 ]] && echo -e "${YELLOW}Hash errors: $HASH_ERRORS${NC}"
     return 1
   fi
 
   mv -- "$hashes_temp" "$TEMP_DIR/hashes.txt"
   [[ $QUIET -eq 0 ]] && echo -e "${GREEN}Hash calculation completed${NC}"
+
+  # Count hash errors by comparing input vs output
+  local hashed_count
+  hashed_count=$(tr -cd '\0' < "$TEMP_DIR/hashes.txt" | wc -c)
+  HASH_ERRORS=$((TOTAL_FILES - hashed_count))
   [[ $HASH_ERRORS -gt 0 ]] && echo -e "${YELLOW}Warning: $HASH_ERRORS files could not be hashed${NC}"
 }
 
@@ -1770,19 +1803,44 @@ generate_csv_report() {
   [[ $QUIET -eq 0 ]] && echo -e "${GREEN}✓ CSV report saved: $csv${NC}"
 }
 
+# Safely escape a string for JSON output
+# Uses jq when available for proper handling of newlines, tabs, and control chars
+json_escape_string() {
+  local str="$1"
+  if command -v jq >/dev/null 2>&1; then
+    # jq handles all escaping properly including newlines, tabs, control chars
+    printf '%s' "$str" | jq -Rs '.'
+  else
+    # Manual fallback - escape backslash, quotes, and control characters
+    local escaped="${str//\\/\\\\}"    # Backslash
+    escaped="${escaped//\"/\\\"}"      # Double quote
+    escaped="${escaped//$'\n'/\\n}"    # Newline
+    escaped="${escaped//$'\r'/\\r}"    # Carriage return
+    escaped="${escaped//$'\t'/\\t}"    # Tab
+    printf '"%s"' "$escaped"
+  fi
+}
+
 generate_json_report() {
   [[ -z "$JSON_REPORT" ]] && return
   [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}Generating JSON report...${NC}"
-  
+
   local json="$OUTPUT_DIR/$JSON_REPORT"
-  
+  local use_jq=0
+  command -v jq >/dev/null 2>&1 && use_jq=1
+
+  # Escape metadata strings
+  local escaped_search_path escaped_author
+  escaped_search_path=$(json_escape_string "$SEARCH_PATH")
+  escaped_author=$(json_escape_string "$AUTHOR")
+
   cat > "$json" << EOF
 {
   "metadata": {
     "version": "$VERSION",
-    "author": "$AUTHOR",
+    "author": ${escaped_author},
     "generated": "$(date -Iseconds 2>/dev/null || date)",
-    "search_path": "$SEARCH_PATH",
+    "search_path": ${escaped_search_path},
     "total_files": ${TOTAL_FILES:-0},
     "total_duplicates": ${TOTAL_DUPLICATES:-0},
     "total_groups": ${TOTAL_DUPLICATE_GROUPS:-0},
@@ -1795,34 +1853,35 @@ EOF
 
   local gid=0
   local first_group=1
-  
+
   while IFS= read -r -d '' rec; do
     local type
     type=$(printf '%s' "$rec" | cut -d"$TAB" -f1)
-    
+
     if [[ "$type" == "G" ]]; then
       local hash file_info
       IFS="$TAB" read -r _ hash file_info <<< "$rec"
-      
+
       if [[ $first_group -eq 0 ]]; then
         echo "      ]" >> "$json"
         echo "    }," >> "$json"
       fi
       first_group=0
       ((gid++))
-      
+
       echo "    {" >> "$json"
       echo "      \"id\": $gid," >> "$json"
       echo "      \"hash\": \"$hash\"," >> "$json"
       echo "      \"files\": [" >> "$json"
-      
+
       local path size mtime
       IFS='|' read -r path size mtime <<< "$file_info"
       local is_system="false"
       is_in_system_folder "$path" && is_system="true"
-      local jpath="${path//\\/\\\\}"; jpath="${jpath//\"/\\\"}"
-      printf '        {"path": "%s", "size": %s, "system": %s}' "$jpath" "$size" "$is_system" >> "$json"
-      
+      local jpath
+      jpath=$(json_escape_string "$path")
+      printf '        {"path": %s, "size": %s, "system": %s}' "$jpath" "$size" "$is_system" >> "$json"
+
     elif [[ "$type" == "F" ]]; then
       local file_info
       IFS="$TAB" read -r _ file_info <<< "$rec"
@@ -1830,11 +1889,12 @@ EOF
       IFS='|' read -r path size mtime <<< "$file_info"
       local is_system="false"
       is_in_system_folder "$path" && is_system="true"
-      local jpath2="${path//\\/\\\\}"; jpath2="${jpath2//\"/\\\"}"
-      printf ',\n        {"path": "%s", "size": %s, "system": %s}' "$jpath2" "$size" "$is_system" >> "$json"
+      local jpath
+      jpath=$(json_escape_string "$path")
+      printf ',\n        {"path": %s, "size": %s, "system": %s}' "$jpath" "$size" "$is_system" >> "$json"
     fi
   done < "$TEMP_DIR/duplicates.nul"
-  
+
   if [[ $first_group -eq 0 ]]; then
     echo "      ]" >> "$json"
     echo "    }" >> "$json"
@@ -1904,7 +1964,7 @@ show_summary() {
   [[ -n "$SCAN_START_TIME" && -n "$SCAN_END_TIME" ]] && \
     echo -e "${CYAN}Scan Duration:${NC}            $(calculate_duration)"
   echo -e "${CYAN}Hash Algorithm:${NC}           ${HASH_ALGORITHM%%sum}"
-  [[ $FAST_MODE -eq 1 ]] && echo -e "${DIM}    (Fast mode: size + filename hash)${NC}"
+  [[ $FAST_MODE -eq 1 ]] && echo -e "${DIM}    (Fast mode: size + first 64KB hash)${NC}"
   echo -e "${CYAN}Threads Used:${NC}             $THREADS"
   [[ $HASH_ERRORS -gt 0 ]] && echo -e "${YELLOW}Hash Errors:${NC}              $HASH_ERRORS"
   echo -e "${WHITE}─────────────────────────────────────────────────────────${NC}"
