@@ -1094,90 +1094,25 @@ find_files() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# HASH CALCULATION (IMPROVED WITH RETRIES AND SAFETY)
+# HASH CALCULATION - Standalone worker for xargs parallel processing
 # ═══════════════════════════════════════════════════════════════════════════
-hash_file_with_timeout() {
-  local file="$1"
-  local algo="$2"
-  local fast="$3"
-  local result=""
-  
-  if [[ ! -f "$file" ]]; then
-    ((HASH_ERRORS++))
-    return 1
-  fi
-  
-  local mtime size
-  mtime=$(safe_stat "$file" "%Y")
-  size=$(safe_stat "$file" "%s")
-  
-  if [[ $USE_CACHE -eq 1 ]]; then
-    local cached_hash
-    local sql_path
-    sql_path=$(sql_escape "$file")
-    cached_hash=$(sqlite3 "$DB_CACHE" "SELECT hash FROM files WHERE path='$sql_path' AND mtime=$mtime AND size=$size;" 2>/dev/null)
-    if [[ -n "$cached_hash" ]]; then
-      result="${cached_hash}${DELIM}${size}${DELIM}${mtime}${DELIM}${file}"
-      [[ $VERBOSE -eq 1 ]] && echo -e "${CYAN}  ~ Used cached hash for: $file${NC}"
-      log_action "info" "Used cached hash for: $file"
-      printf '%s\0' "$result"
-      return 0
-    fi
-  fi
-  
-  if [[ "$fast" == "1" ]]; then
-    # Fast mode: Hash first 64KB of the file instead of just the name
-    # This is much more accurate than name-based matching while still being fast
-    local partial_hash
-    partial_hash=$(head -c 65536 -- "$file" 2>/dev/null | md5sum | cut -d' ' -f1)
-    if [[ -z "$partial_hash" ]]; then
-      ((HASH_ERRORS++))
-      log_action "warning" "Fast mode partial hash failed: $file"
-      return 1
-    fi
-    result="${size}_${partial_hash}${DELIM}${size}${DELIM}${mtime}${DELIM}${file}"
-  else
-    local hash try=0
-    while :; do
-      hash=$( $IONICE_PREFIX $NICE_PREFIX timeout "$HASH_TIMEOUT" "$algo" -- "$file" 2>/dev/null | cut -d' ' -f1 )
-      local exit_code=$?
-      # Check for timeout (exit code 124) or other failure, or empty hash
-      if [[ $exit_code -eq 0 && -n "$hash" ]]; then
-        break
-      fi
-      ((try++))
-      if [[ $try -ge $MAX_RETRIES ]]; then
-        ((HASH_ERRORS++))
-        if [[ $exit_code -eq 124 ]]; then
-          log_action "warning" "Hash timeout after $MAX_RETRIES attempts: $file"
-        else
-          log_action "warning" "Hash failed after $MAX_RETRIES attempts: $file"
-        fi
-        return 1
-      fi
-      sleep 1
-    done
-    result="${hash}${DELIM}${size}${DELIM}${mtime}${DELIM}${file}"
-  fi
-  
-  if [[ $USE_CACHE -eq 1 && -n "$result" ]]; then
-    local hash_val
-    hash_val=$(echo "$result" | cut -d"$DELIM" -f1)
-    local sql_path
-    sql_path=$(sql_escape "$file")
-    sqlite3 "$DB_CACHE" "INSERT OR REPLACE INTO files (path, hash, size, mtime) VALUES ('$sql_path', '$hash_val', $size, $mtime);" 2>/dev/null || \
-      log_action "warning" "Failed to cache hash for: $file"
-  fi
-  
-  [[ -n "$result" ]] && printf '%s\0' "$result"
+
+# SQL escape helper - must be exported for xargs worker
+_sql_escape() {
+  local str="$1"
+  printf '%s' "${str//\'/\'\'}"
 }
+export -f _sql_escape
 
 # Standalone hash worker function for xargs - outputs null-terminated hash records
 # This is called by xargs with file path as argument
+# Supports caching when DUPEFINDER_USE_CACHE=1 and DUPEFINDER_DB_CACHE is set
 _hash_worker() {
   local file="$1"
   local algo="$DUPEFINDER_ALGO"
   local fast="$DUPEFINDER_FAST"
+  local use_cache="${DUPEFINDER_USE_CACHE:-0}"
+  local db_cache="$DUPEFINDER_DB_CACHE"
   local delim=$'\t'
 
   [[ ! -f "$file" ]] && return 1
@@ -1187,18 +1122,42 @@ _hash_worker() {
   size=$(stat -c "%s" -- "$file" 2>/dev/null || echo "0")
 
   local result=""
+  local hash_val=""
 
+  # Check cache first if enabled
+  if [[ "$use_cache" == "1" && -n "$db_cache" && -f "$db_cache" ]]; then
+    local sql_path
+    sql_path=$(_sql_escape "$file")
+    local cached_hash
+    cached_hash=$(sqlite3 "$db_cache" "SELECT hash FROM files WHERE path='$sql_path' AND mtime=$mtime AND size=$size;" 2>/dev/null)
+    if [[ -n "$cached_hash" ]]; then
+      result="${cached_hash}${delim}${size}${delim}${mtime}${delim}${file}"
+      printf '%s\0' "$result"
+      return 0
+    fi
+  fi
+
+  # Calculate hash
   if [[ "$fast" == "1" ]]; then
     # Fast mode: Hash first 64KB of the file
     local partial_hash
     partial_hash=$(head -c 65536 -- "$file" 2>/dev/null | md5sum | cut -d' ' -f1)
     [[ -z "$partial_hash" ]] && return 1
-    result="${size}_${partial_hash}${delim}${size}${delim}${mtime}${delim}${file}"
+    hash_val="${size}_${partial_hash}"
+    result="${hash_val}${delim}${size}${delim}${mtime}${delim}${file}"
   else
     local hash
     hash=$(timeout "${DUPEFINDER_TIMEOUT:-30}" "$algo" -- "$file" 2>/dev/null | cut -d' ' -f1)
     [[ -z "$hash" ]] && return 1
-    result="${hash}${delim}${size}${delim}${mtime}${delim}${file}"
+    hash_val="$hash"
+    result="${hash_val}${delim}${size}${delim}${mtime}${delim}${file}"
+  fi
+
+  # Store in cache if enabled
+  if [[ "$use_cache" == "1" && -n "$db_cache" && -n "$hash_val" ]]; then
+    local sql_path
+    sql_path=$(_sql_escape "$file")
+    sqlite3 "$db_cache" "INSERT OR REPLACE INTO files (path, hash, size, mtime) VALUES ('$sql_path', '$hash_val', $size, $mtime);" 2>/dev/null || true
   fi
 
   [[ -n "$result" ]] && printf '%s\0' "$result"
@@ -1230,11 +1189,14 @@ calculate_hashes() {
   export DUPEFINDER_ALGO="$HASH_ALGORITHM"
   export DUPEFINDER_FAST="$FAST_MODE"
   export DUPEFINDER_TIMEOUT="$HASH_TIMEOUT"
+  export DUPEFINDER_USE_CACHE="$USE_CACHE"
+  export DUPEFINDER_DB_CACHE="$DB_CACHE"
 
   # Use xargs for parallel processing - much more efficient than spawning subshells
   # This eliminates the "fork bomb" issue by using a process pool
   if [[ $VERBOSE -eq 1 && $QUIET -eq 0 ]]; then
     echo -e "${DIM}Processing files with xargs -P $THREADS...${NC}"
+    [[ $USE_CACHE -eq 1 ]] && echo -e "${DIM}Cache enabled: $DB_CACHE${NC}"
   fi
 
   # xargs -0: null-terminated input, -P: parallel processes, -n1: one file per invocation
@@ -1247,7 +1209,7 @@ calculate_hashes() {
   FILES_PROCESSED=$TOTAL_FILES
 
   # Clean up exported variables
-  unset DUPEFINDER_ALGO DUPEFINDER_FAST DUPEFINDER_TIMEOUT
+  unset DUPEFINDER_ALGO DUPEFINDER_FAST DUPEFINDER_TIMEOUT DUPEFINDER_USE_CACHE DUPEFINDER_DB_CACHE
 
   if [[ ! -s "$hashes_temp" ]]; then
     echo -e "${RED}Error: No files were successfully hashed.${NC}"
