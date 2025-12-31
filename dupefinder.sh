@@ -1117,9 +1117,10 @@ _hash_worker() {
 
   [[ ! -f "$file" ]] && return 1
 
-  local mtime size
-  mtime=$(stat -c "%Y" -- "$file" 2>/dev/null || echo "0")
-  size=$(stat -c "%s" -- "$file" 2>/dev/null || echo "0")
+  # Single stat call for both mtime and size (avoids double syscall)
+  local stat_output mtime size
+  stat_output=$(stat -c "%Y %s" -- "$file" 2>/dev/null) || return 1
+  read -r mtime size <<< "$stat_output"
 
   local result=""
   local hash_val=""
